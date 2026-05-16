@@ -1,3 +1,4 @@
+require('dotenv').config();
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 
@@ -6,9 +7,13 @@ const httpServer = createServer((req, res) => {
   res.end('Socket.io server is running');
 });
 
+const allowedOrigins = process.env.CLIENT_URL 
+  ? process.env.CLIENT_URL.split(',') 
+  : '*';
+
 const io = new Server(httpServer, {
   cors: {
-    origin: '*',
+    origin: allowedOrigins,
     methods: ['GET', 'POST']
   }
 });
