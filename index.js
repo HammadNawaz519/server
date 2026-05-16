@@ -8,22 +8,49 @@ const httpServer = createServer((req, res) => {
 
 const io = new Server(httpServer, {
   cors: {
-    origin: '*', // Change to your Vercel URL in production e.g. 'https://your-app.vercel.app'
+    origin: ['http://localhost:3000', 'https://the-dev-core.vercel.app'],
     methods: ['GET', 'POST']
   }
 });
 
+// Track online users: email -> Set of socket IDs (multiple tabs)
+const onlineUsers = new Map(); // email -> Set<socketId>
+// Track which socket is in an active call
+const activeCalls = new Set(); // socketIds currently in a call
+
+// Helper: get all socket IDs for an email
+function getRoomSockets(email) {
+  return io.sockets.adapter.rooms.get(email) || new Set();
+}
+
+// Helper: broadcast updated online users list to everyone
+function broadcastOnlineUsers() {
+  const onlineList = Array.from(onlineUsers.keys());
+  io.emit('online_users', onlineList);
+}
+
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
 
+  // ─── IDENTIFY ────────────────────────────────────────────────────────────────
   socket.on('identify', ({ email }) => {
     if (!email) return;
     const room = email.toLowerCase().trim();
+
     socket.join(room);
     socket.userEmail = room;
-    console.log(`User identified: ${room}`);
+
+    // Track online presence
+    if (!onlineUsers.has(room)) {
+      onlineUsers.set(room, new Set());
+    }
+    onlineUsers.get(room).add(socket.id);
+    broadcastOnlineUsers();
+
+    console.log(`User identified: ${room} (${socket.id})`);
   });
 
+  // ─── MESSAGING ───────────────────────────────────────────────────────────────
   socket.on('send_social_message', (data) => {
     const { receiverEmail, ...msgData } = data;
     const target = receiverEmail.toLowerCase().trim();
@@ -39,6 +66,7 @@ io.on('connection', (socket) => {
     socket.to(receiverEmail.toLowerCase().trim()).emit('receive_social_delete', deleteData);
   });
 
+  // ─── TYPING ──────────────────────────────────────────────────────────────────
   socket.on('typing', ({ receiverEmail }) => {
     socket.to(receiverEmail.toLowerCase().trim()).emit('user_typing', { email: socket.userEmail });
   });
@@ -47,35 +75,98 @@ io.on('connection', (socket) => {
     socket.to(receiverEmail.toLowerCase().trim()).emit('user_stop_typing', { email: socket.userEmail });
   });
 
+  // ─── SEEN ────────────────────────────────────────────────────────────────────
   socket.on('mark_as_seen', ({ senderEmail }) => {
     if (senderEmail) {
       socket.to(senderEmail.toLowerCase().trim()).emit('messages_seen');
     }
   });
 
-  // --- CALL EVENTS ---
+  // ─── CALL EVENTS ─────────────────────────────────────────────────────────────
+
+  // Caller initiates a call
   socket.on('call_user', (data) => {
-    socket.to(data.to.toLowerCase().trim()).emit('incoming_call', { from: data.from, type: data.type });
+    const target = data.to.toLowerCase().trim();
+
+    // Check if the target is already in an active call
+    const targetSockets = getRoomSockets(target);
+    const isTargetBusy = [...targetSockets].some(sid => activeCalls.has(sid));
+
+    if (isTargetBusy) {
+      // Notify caller that the target is busy
+      socket.emit('call_busy', { email: target });
+      console.log(`Call to ${target} rejected - user is busy`);
+      return;
+    }
+
+    socket.to(target).emit('incoming_call', {
+      from: data.from,
+      type: data.type
+    });
+    console.log(`Call from ${socket.userEmail} to ${target} (${data.type})`);
   });
 
+  // Receiver accepts the call
   socket.on('accept_call', (data) => {
-    socket.to(data.to.toLowerCase().trim()).emit('call_accepted', { from: data.from });
+    const target = data.to.toLowerCase().trim();
+    // Mark both parties as in a call
+    activeCalls.add(socket.id);
+    const targetSockets = getRoomSockets(target);
+    targetSockets.forEach(sid => activeCalls.add(sid));
+
+    socket.to(target).emit('call_accepted', { from: data.from });
+    console.log(`Call accepted between ${socket.userEmail} and ${target}`);
   });
 
+  // Receiver rejects the call
   socket.on('reject_call', (data) => {
-    socket.to(data.to.toLowerCase().trim()).emit('call_rejected');
+    const target = data.to.toLowerCase().trim();
+    socket.to(target).emit('call_rejected', { by: socket.userEmail });
+    console.log(`Call rejected by ${socket.userEmail}`);
   });
 
+  // Either party ends the call
   socket.on('end_call', (data) => {
-    socket.to(data.to.toLowerCase().trim()).emit('call_ended');
+    const target = data.to.toLowerCase().trim();
+
+    // Remove both from active calls
+    activeCalls.delete(socket.id);
+    const targetSockets = getRoomSockets(target);
+    targetSockets.forEach(sid => activeCalls.delete(sid));
+
+    socket.to(target).emit('call_ended');
+    console.log(`Call ended by ${socket.userEmail} with ${target}`);
   });
 
+  // WebRTC Signaling relay (SDP offers/answers + ICE candidates)
   socket.on('webrtc_signal', (data) => {
-    socket.to(data.to.toLowerCase().trim()).emit('webrtc_signal', data.signal);
+    const target = data.to.toLowerCase().trim();
+    // Relay signal with sender info for multi-party edge cases
+    socket.to(target).emit('webrtc_signal', {
+      ...data.signal,
+      from: socket.userEmail
+    });
   });
 
+  // ─── DISCONNECT ──────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     console.log('Socket disconnected:', socket.id);
+
+    // Remove from active calls
+    activeCalls.delete(socket.id);
+
+    // Remove from online tracking
+    if (socket.userEmail) {
+      const sockets = onlineUsers.get(socket.userEmail);
+      if (sockets) {
+        sockets.delete(socket.id);
+        if (sockets.size === 0) {
+          // No more tabs open — user is offline
+          onlineUsers.delete(socket.userEmail);
+          broadcastOnlineUsers();
+        }
+      }
+    }
   });
 });
 
