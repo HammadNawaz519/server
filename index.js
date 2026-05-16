@@ -177,5 +177,6 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3001;
 httpServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`Socket.io server listening on port ${PORT}`);
+  console.log(`>>> Server is running on port ${PORT}`);
+  console.log(`>>> Allowed Origins: ${process.env.CLIENT_URL || '*'}`);
 });
