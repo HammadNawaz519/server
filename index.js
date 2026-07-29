@@ -18,14 +18,15 @@ const io = new Server(httpServer, {
   }
 });
 
-// Track online users: email -> Set of socket IDs (multiple tabs)
-const onlineUsers = new Map(); // email -> Set<socketId>
+// Track online users: identifier -> Set of socket IDs (multiple tabs)
+const onlineUsers = new Map(); // email or userId -> Set<socketId>
 // Track which socket is in an active call
 const activeCalls = new Set(); // socketIds currently in a call
 
-// Helper: get all socket IDs for an email
-function getRoomSockets(email) {
-  return io.sockets.adapter.rooms.get(email) || new Set();
+// Helper: get all socket IDs for a target room
+function getRoomSockets(target) {
+  if (!target) return new Set();
+  return io.sockets.adapter.rooms.get(target) || new Set();
 }
 
 // Helper: broadcast updated online users list to everyone
@@ -37,47 +38,95 @@ function broadcastOnlineUsers() {
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
 
+  // Send current online users immediately on connection
+  socket.emit('online_users', Array.from(onlineUsers.keys()));
+
   // ─── IDENTIFY ────────────────────────────────────────────────────────────────
-  socket.on('identify', ({ email }) => {
-    if (!email) return;
-    const room = email.toLowerCase().trim();
-
-    socket.join(room);
-    socket.userEmail = room;
-
-    // Track online presence
-    if (!onlineUsers.has(room)) {
-      onlineUsers.set(room, new Set());
+  socket.on('identify', ({ email, userId }) => {
+    if (email) {
+      const emailRoom = email.toLowerCase().trim();
+      socket.join(emailRoom);
+      socket.userEmail = emailRoom;
+      if (!onlineUsers.has(emailRoom)) {
+        onlineUsers.set(emailRoom, new Set());
+      }
+      onlineUsers.get(emailRoom).add(socket.id);
     }
-    onlineUsers.get(room).add(socket.id);
-    broadcastOnlineUsers();
 
-    console.log(`User identified: ${room} (${socket.id})`);
+    if (userId) {
+      const idRoom = String(userId).trim();
+      socket.join(idRoom);
+      socket.userId = idRoom;
+      if (!onlineUsers.has(idRoom)) {
+        onlineUsers.set(idRoom, new Set());
+      }
+      onlineUsers.get(idRoom).add(socket.id);
+    }
+
+    broadcastOnlineUsers();
+    console.log(`User identified: ${socket.userEmail || ''} / ${socket.userId || ''} (${socket.id})`);
   });
 
   // ─── MESSAGING ───────────────────────────────────────────────────────────────
   socket.on('send_social_message', (data) => {
-    const { receiverEmail, ...msgData } = data;
-    const target = receiverEmail.toLowerCase().trim();
-    socket.to(target).emit('receive_social_message', msgData);
+    const { receiverEmail, receiverId, ...msgData } = data;
+    
+    if (receiverEmail) {
+      socket.to(receiverEmail.toLowerCase().trim()).emit('receive_social_message', msgData);
+    }
+    if (receiverId) {
+      socket.to(String(receiverId).trim()).emit('receive_social_message', msgData);
+    }
+
     // Echo to sender's other tabs
     if (socket.userEmail) {
       socket.to(socket.userEmail).emit('receive_social_message', msgData);
     }
+    if (socket.userId) {
+      socket.to(socket.userId).emit('receive_social_message', msgData);
+    }
   });
 
   socket.on('delete_social_message', (data) => {
-    const { receiverEmail, ...deleteData } = data;
-    socket.to(receiverEmail.toLowerCase().trim()).emit('receive_social_delete', deleteData);
+    const { receiverEmail, receiverId, ...deleteData } = data;
+    if (receiverEmail) {
+      socket.to(receiverEmail.toLowerCase().trim()).emit('receive_social_delete', deleteData);
+    }
+    if (receiverId) {
+      socket.to(String(receiverId).trim()).emit('receive_social_delete', deleteData);
+    }
+  });
+
+  // ─── FOLLOW / REQUEST EVENTS ──────────────────────────────────────────────────
+  socket.on('social_request_event', (data) => {
+    const { targetEmail, targetUserId, ...eventData } = data;
+    if (targetEmail) {
+      socket.to(targetEmail.toLowerCase().trim()).emit('receive_social_request_event', eventData);
+    }
+    if (targetUserId) {
+      socket.to(String(targetUserId).trim()).emit('receive_social_request_event', eventData);
+    }
   });
 
   // ─── TYPING ──────────────────────────────────────────────────────────────────
-  socket.on('typing', ({ receiverEmail }) => {
-    socket.to(receiverEmail.toLowerCase().trim()).emit('user_typing', { email: socket.userEmail });
+  socket.on('typing', ({ receiverEmail, receiverId }) => {
+    const payload = { email: socket.userEmail, userId: socket.userId };
+    if (receiverEmail) {
+      socket.to(receiverEmail.toLowerCase().trim()).emit('user_typing', payload);
+    }
+    if (receiverId) {
+      socket.to(String(receiverId).trim()).emit('user_typing', payload);
+    }
   });
 
-  socket.on('stop_typing', ({ receiverEmail }) => {
-    socket.to(receiverEmail.toLowerCase().trim()).emit('user_stop_typing', { email: socket.userEmail });
+  socket.on('stop_typing', ({ receiverEmail, receiverId }) => {
+    const payload = { email: socket.userEmail, userId: socket.userId };
+    if (receiverEmail) {
+      socket.to(receiverEmail.toLowerCase().trim()).emit('user_stop_typing', payload);
+    }
+    if (receiverId) {
+      socket.to(String(receiverId).trim()).emit('user_stop_typing', payload);
+    }
   });
 
   // ─── SEEN ────────────────────────────────────────────────────────────────────
@@ -219,16 +268,22 @@ io.on('connection', (socket) => {
     }
 
     // Remove from online tracking
-    if (socket.userEmail) {
-      const sockets = onlineUsers.get(socket.userEmail);
+    const roomsToClean = [socket.userEmail, socket.userId].filter(Boolean);
+    let changed = false;
+
+    roomsToClean.forEach(room => {
+      const sockets = onlineUsers.get(room);
       if (sockets) {
         sockets.delete(socket.id);
         if (sockets.size === 0) {
-          // No more tabs open — user is offline
-          onlineUsers.delete(socket.userEmail);
-          broadcastOnlineUsers();
+          onlineUsers.delete(room);
+          changed = true;
         }
       }
+    });
+
+    if (changed) {
+      broadcastOnlineUsers();
     }
   });
 });
