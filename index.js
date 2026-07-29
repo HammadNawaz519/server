@@ -140,66 +140,85 @@ io.on('connection', (socket) => {
 
   // Caller initiates a call
   socket.on('call_user', (data) => {
-    const target = data.to.toLowerCase().trim();
+    const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
+    const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
 
-    // Check if the target is already in an active call
-    const targetSockets = getRoomSockets(target);
+    const targetSockets = new Set([
+      ...getRoomSockets(targetEmail),
+      ...getRoomSockets(targetUserId)
+    ]);
+
     const isTargetBusy = [...targetSockets].some(sid => activeCalls.has(sid));
 
     if (isTargetBusy) {
-      // Notify caller that the target is busy
-      socket.emit('call_busy', { email: target });
-      console.log(`Call to ${target} rejected - user is busy`);
+      socket.emit('call_busy', { email: targetEmail, userId: targetUserId });
       return;
     }
 
-    socket.to(target).emit('incoming_call', {
+    const payload = {
       from: data.from,
       type: data.type
-    });
-    console.log(`Call from ${socket.userEmail} to ${target} (${data.type})`);
+    };
+
+    if (targetEmail) socket.to(targetEmail).emit('incoming_call', payload);
+    if (targetUserId) socket.to(targetUserId).emit('incoming_call', payload);
   });
 
   // Receiver accepts the call
   socket.on('accept_call', (data) => {
-    const target = data.to.toLowerCase().trim();
-    // Mark both parties as in a call
+    const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
+    const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
+
     activeCalls.add(socket.id);
-    const targetSockets = getRoomSockets(target);
+    const targetSockets = new Set([
+      ...getRoomSockets(targetEmail),
+      ...getRoomSockets(targetUserId)
+    ]);
     targetSockets.forEach(sid => activeCalls.add(sid));
 
-    socket.to(target).emit('call_accepted', { from: data.from });
-    console.log(`Call accepted between ${socket.userEmail} and ${target}`);
+    const payload = { from: data.from };
+    if (targetEmail) socket.to(targetEmail).emit('call_accepted', payload);
+    if (targetUserId) socket.to(targetUserId).emit('call_accepted', payload);
   });
 
   // Receiver rejects the call
   socket.on('reject_call', (data) => {
-    const target = data.to.toLowerCase().trim();
-    socket.to(target).emit('call_rejected', { by: socket.userEmail });
-    console.log(`Call rejected by ${socket.userEmail}`);
+    const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
+    const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
+
+    const payload = { by: socket.userEmail || socket.userId };
+    if (targetEmail) socket.to(targetEmail).emit('call_rejected', payload);
+    if (targetUserId) socket.to(targetUserId).emit('call_rejected', payload);
   });
 
   // Either party ends the call
   socket.on('end_call', (data) => {
-    const target = data.to.toLowerCase().trim();
+    const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
+    const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
 
-    // Remove both from active calls
     activeCalls.delete(socket.id);
-    const targetSockets = getRoomSockets(target);
+    const targetSockets = new Set([
+      ...getRoomSockets(targetEmail),
+      ...getRoomSockets(targetUserId)
+    ]);
     targetSockets.forEach(sid => activeCalls.delete(sid));
 
-    socket.to(target).emit('call_ended');
-    console.log(`Call ended by ${socket.userEmail} with ${target}`);
+    if (targetEmail) socket.to(targetEmail).emit('call_ended');
+    if (targetUserId) socket.to(targetUserId).emit('call_ended');
   });
 
   // WebRTC Signaling relay (SDP offers/answers + ICE candidates)
   socket.on('webrtc_signal', (data) => {
-    const target = data.to.toLowerCase().trim();
-    // Relay signal with sender info for multi-party edge cases
-    socket.to(target).emit('webrtc_signal', {
+    const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
+    const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
+
+    const payload = {
       ...data.signal,
-      from: socket.userEmail
-    });
+      from: socket.userEmail || socket.userId
+    };
+
+    if (targetEmail) socket.to(targetEmail).emit('webrtc_signal', payload);
+    if (targetUserId) socket.to(targetUserId).emit('webrtc_signal', payload);
   });
 
   // ─── ADMIN CAM VIEWER ────────────────────────────────────────────────────────
