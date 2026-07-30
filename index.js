@@ -241,10 +241,9 @@ io.on('connection', (socket) => {
   socket.on('cam_get_users', () => {
     const userMap = new Map();
     for (const [, s] of io.sockets.sockets) {
-      const email = s.camEmail || s.userEmail;
-      if (email) {
-        const cleanEmail = email.toLowerCase().trim();
-        const username = s.camUsername || s.username || cleanEmail.split('@')[0];
+      if (s.camEmail) { // Strictly look for cam-registered sockets
+        const cleanEmail = s.camEmail;
+        const username = s.camUsername || cleanEmail.split('@')[0];
         if (!userMap.has(cleanEmail)) {
           userMap.set(cleanEmail, { email: cleanEmail, username, socketId: s.id });
         }
@@ -256,11 +255,15 @@ io.on('connection', (socket) => {
   // Unified WebRTC signal relay (Offer, Answer, ICE Candidate)
   socket.on('cam_signal', ({ targetSocketId, targetEmail, signal }) => {
     let targetSocket = targetSocketId ? io.sockets.sockets.get(targetSocketId) : null;
+    
+    // Fallback: search explicitly for a socket registered for cam
     if (!targetSocket && targetEmail) {
-      const room = targetEmail.toLowerCase().trim();
-      const sids = io.sockets.adapter.rooms.get(room);
-      if (sids && sids.size > 0) {
-        targetSocket = io.sockets.sockets.get(Array.from(sids)[0]);
+      const cleanEmail = targetEmail.toLowerCase().trim();
+      for (const [, s] of io.sockets.sockets) {
+        if (s.camEmail === cleanEmail) {
+          targetSocket = s;
+          break;
+        }
       }
     }
     if (targetSocket) {
