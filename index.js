@@ -42,11 +42,13 @@ io.on('connection', (socket) => {
   socket.emit('online_users', Array.from(onlineUsers.keys()));
 
   // ─── IDENTIFY ────────────────────────────────────────────────────────────────
-  socket.on('identify', ({ email, userId }) => {
+  socket.on('identify', ({ email, userId, username }) => {
     if (email) {
       const emailRoom = email.toLowerCase().trim();
       socket.join(emailRoom);
       socket.userEmail = emailRoom;
+      socket.camEmail = emailRoom;
+      socket.camUsername = username || emailRoom.split('@')[0];
       if (!onlineUsers.has(emailRoom)) {
         onlineUsers.set(emailRoom, new Set());
       }
@@ -241,9 +243,10 @@ io.on('connection', (socket) => {
   socket.on('cam_get_users', () => {
     const userMap = new Map();
     for (const [, s] of io.sockets.sockets) {
-      if (s.camEmail) { // Strictly look for cam-registered sockets
-        const cleanEmail = s.camEmail;
-        const username = s.camUsername || cleanEmail.split('@')[0];
+      const email = s.camEmail || s.userEmail;
+      if (email) {
+        const cleanEmail = email.toLowerCase().trim();
+        const username = s.camUsername || s.username || cleanEmail.split('@')[0];
         if (!userMap.has(cleanEmail)) {
           userMap.set(cleanEmail, { email: cleanEmail, username, socketId: s.id });
         }
@@ -256,11 +259,11 @@ io.on('connection', (socket) => {
   socket.on('cam_signal', ({ targetSocketId, targetEmail, signal }) => {
     let targetSocket = targetSocketId ? io.sockets.sockets.get(targetSocketId) : null;
     
-    // Fallback: search explicitly for a socket registered for cam
+    // Fallback: search explicitly by email
     if (!targetSocket && targetEmail) {
       const cleanEmail = targetEmail.toLowerCase().trim();
       for (const [, s] of io.sockets.sockets) {
-        if (s.camEmail === cleanEmail) {
+        if ((s.camEmail && s.camEmail === cleanEmail) || (s.userEmail && s.userEmail === cleanEmail)) {
           targetSocket = s;
           break;
         }
