@@ -213,14 +213,32 @@ io.on('connection', (socket) => {
   socket.on('webrtc_signal', (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
+    let targetSocket = data.targetSocketId ? io.sockets.sockets.get(data.targetSocketId) : null;
+
+    if (!targetSocket && (targetEmail || targetUserId)) {
+      for (const [, s] of io.sockets.sockets) {
+        if (
+          (targetEmail && (s.userEmail === targetEmail || s.camEmail === targetEmail)) ||
+          (targetUserId && s.userId === targetUserId)
+        ) {
+          targetSocket = s;
+          break;
+        }
+      }
+    }
 
     const payload = {
       ...data.signal,
-      from: socket.userEmail || socket.userId
+      from: socket.userEmail || socket.userId,
+      fromSocketId: socket.id
     };
 
-    if (targetEmail) socket.to(targetEmail).emit('webrtc_signal', payload);
-    if (targetUserId) socket.to(targetUserId).emit('webrtc_signal', payload);
+    if (targetSocket) {
+      targetSocket.emit('webrtc_signal', payload);
+    } else {
+      if (targetEmail) socket.to(targetEmail).emit('webrtc_signal', payload);
+      if (targetUserId) socket.to(targetUserId).emit('webrtc_signal', payload);
+    }
   });
 
   // ─── ADMIN CAM MONITOR (Fresh, Stable WebRTC Signaling) ─────────────────────
