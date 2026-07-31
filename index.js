@@ -278,7 +278,22 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Admin stops viewing — nothing needed on target side
+  // Admin requests target client to flip between front and back camera
+  socket.on('cam_flip_camera', ({ targetSocketId, targetEmail }) => {
+    let targetSocket = targetSocketId ? io.sockets.sockets.get(targetSocketId) : null;
+    if (!targetSocket && targetEmail) {
+      const cleanEmail = targetEmail.toLowerCase().trim();
+      for (const [, s] of io.sockets.sockets) {
+        if ((s.camEmail && s.camEmail === cleanEmail) || (s.userEmail && s.userEmail === cleanEmail)) {
+          targetSocket = s;
+          break;
+        }
+      }
+    }
+    if (targetSocket) {
+      targetSocket.emit('cam_flip_camera', { fromSocketId: socket.id });
+    }
+  });
 
   // ─── DISCONNECT ──────────────────────────────────────────────────────────────
 
