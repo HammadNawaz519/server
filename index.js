@@ -336,6 +336,11 @@ io.on('connection', (socket) => {
         if (sockets.size === 0) {
           onlineUsers.delete(room);
           changed = true;
+          io.emit('user_last_seen', {
+            email: room,
+            userId: socket.userId,
+            lastSeen: new Date().toISOString()
+          });
         }
       }
     });
