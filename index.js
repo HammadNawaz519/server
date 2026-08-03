@@ -73,19 +73,16 @@ io.on('connection', (socket) => {
   socket.on('send_social_message', (data) => {
     const { receiverEmail, receiverId, ...msgData } = data;
     
-    if (receiverEmail) {
-      socket.to(receiverEmail.toLowerCase().trim()).emit('receive_social_message', msgData);
-    }
-    if (receiverId) {
-      socket.to(String(receiverId).trim()).emit('receive_social_message', msgData);
+    // Avoid double emissions if receiver socket is in both email & userId rooms
+    const targetRoom = receiverEmail ? receiverEmail.toLowerCase().trim() : receiverId ? String(receiverId).trim() : null;
+    if (targetRoom) {
+      socket.to(targetRoom).emit('receive_social_message', msgData);
     }
 
     // Echo to sender's other tabs
-    if (socket.userEmail) {
-      socket.to(socket.userEmail).emit('receive_social_message', msgData);
-    }
-    if (socket.userId) {
-      socket.to(socket.userId).emit('receive_social_message', msgData);
+    const senderRoom = socket.userEmail || socket.userId;
+    if (senderRoom) {
+      socket.to(senderRoom).emit('receive_social_message', msgData);
     }
   });
 
