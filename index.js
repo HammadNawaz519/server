@@ -103,20 +103,22 @@ io.on('connection', (socket) => {
 
   socket.on('change_chat_theme', (data) => {
     const { receiverEmail, receiverId, ...themeData } = data;
-    if (receiverEmail) {
-      socket.to(receiverEmail.toLowerCase().trim()).emit('receive_chat_theme', themeData);
+    const targetRoom = receiverEmail ? receiverEmail.toLowerCase().trim() : receiverId ? String(receiverId).trim() : null;
+    if (targetRoom) {
+      socket.to(targetRoom).emit('receive_chat_theme', themeData);
     }
-    if (receiverId) {
+    if (receiverId && String(receiverId).trim() !== targetRoom) {
       socket.to(String(receiverId).trim()).emit('receive_chat_theme', themeData);
     }
   });
 
   socket.on('change_nickname', (data) => {
     const { receiverEmail, receiverId, ...nicknameData } = data;
-    if (receiverEmail) {
-      socket.to(receiverEmail.toLowerCase().trim()).emit('receive_nickname', nicknameData);
+    const targetRoom = receiverEmail ? receiverEmail.toLowerCase().trim() : receiverId ? String(receiverId).trim() : null;
+    if (targetRoom) {
+      socket.to(targetRoom).emit('receive_nickname', nicknameData);
     }
-    if (receiverId) {
+    if (receiverId && String(receiverId).trim() !== targetRoom) {
       socket.to(String(receiverId).trim()).emit('receive_nickname', nicknameData);
     }
   });
