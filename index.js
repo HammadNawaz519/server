@@ -96,6 +96,27 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('change_chat_theme', (data) => {
+    const { receiverEmail, receiverId, ...themeData } = data;
+    if (receiverEmail) {
+      socket.to(receiverEmail.toLowerCase().trim()).emit('receive_chat_theme', themeData);
+    }
+    if (receiverId) {
+      socket.to(String(receiverId).trim()).emit('receive_chat_theme', themeData);
+    }
+  });
+
+  socket.on('change_nickname', (data) => {
+    const { receiverEmail, receiverId, ...nicknameData } = data;
+    if (receiverEmail) {
+      socket.to(receiverEmail.toLowerCase().trim()).emit('receive_nickname', nicknameData);
+    }
+    if (receiverId) {
+      socket.to(String(receiverId).trim()).emit('receive_nickname', nicknameData);
+    }
+  });
+
+
   // ─── FOLLOW / REQUEST EVENTS ──────────────────────────────────────────────────
   socket.on('social_request_event', (data) => {
     const { targetEmail, targetUserId, ...eventData } = data;
