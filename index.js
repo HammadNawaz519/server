@@ -365,7 +365,7 @@ io.on('connection', (socket) => {
           onlineUsers.delete(room);
           changed = true;
           io.emit('user_last_seen', {
-            email: room,
+            email: socket.userEmail,
             userId: socket.userId,
             lastSeen: new Date().toISOString()
           });
