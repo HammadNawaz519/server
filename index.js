@@ -233,9 +233,9 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ─── CALL EVENTS ─────────────────────────────────────────────────────────────
+  // ─── CALL & WEBRTC SIGNALING EVENTS ──────────────────────────────────────────
 
-  socket.on('call_user', (data) => {
+  const handleCallRequest = (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
 
@@ -247,17 +247,20 @@ io.on('connection', (socket) => {
     const isTargetBusy = [...targetSockets].some(sid => activeCalls.has(sid));
 
     if (isTargetBusy) {
-      socket.emit('call_busy', { email: targetEmail, userId: targetUserId });
+      socket.emit('call_busy', { email: targetEmail, userId: targetUserId, callId: data.callId });
       return;
     }
 
-    const payload = { from: data.from, type: data.type };
+    const payload = { from: data.from, type: data.type, callId: data.callId || `call-${Date.now()}` };
 
     if (targetEmail) socket.to(targetEmail).emit('incoming_call', payload);
     if (targetUserId) socket.to(targetUserId).emit('incoming_call', payload);
-  });
+  };
 
-  socket.on('accept_call', (data) => {
+  socket.on('call_user', handleCallRequest);
+  socket.on('call_request', handleCallRequest);
+
+  const handleCallAccept = (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
 
@@ -268,21 +271,57 @@ io.on('connection', (socket) => {
     ]);
     targetSockets.forEach(sid => activeCalls.add(sid));
 
-    const payload = { from: data.from };
-    if (targetEmail) socket.to(targetEmail).emit('call_accepted', payload);
-    if (targetUserId) socket.to(targetUserId).emit('call_accepted', payload);
-  });
+    const payload = { from: data.from, callId: data.callId };
+    if (targetEmail) {
+      socket.to(targetEmail).emit('call_accepted', payload);
+      socket.to(targetEmail).emit('call_accept', payload);
+    }
+    if (targetUserId) {
+      socket.to(targetUserId).emit('call_accepted', payload);
+      socket.to(targetUserId).emit('call_accept', payload);
+    }
+  };
 
-  socket.on('reject_call', (data) => {
+  socket.on('accept_call', handleCallAccept);
+  socket.on('call_accept', handleCallAccept);
+
+  const handleCallDecline = (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
 
-    const payload = { by: socket.userEmail || socket.userId };
-    if (targetEmail) socket.to(targetEmail).emit('call_rejected', payload);
-    if (targetUserId) socket.to(targetUserId).emit('call_rejected', payload);
+    const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
+    if (targetEmail) {
+      socket.to(targetEmail).emit('call_rejected', payload);
+      socket.to(targetEmail).emit('call_decline', payload);
+    }
+    if (targetUserId) {
+      socket.to(targetUserId).emit('call_rejected', payload);
+      socket.to(targetUserId).emit('call_decline', payload);
+    }
+  };
+
+  socket.on('reject_call', handleCallDecline);
+  socket.on('call_decline', handleCallDecline);
+
+  socket.on('call_cancel', (data) => {
+    const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
+    const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
+
+    const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
+    if (targetEmail) socket.to(targetEmail).emit('call_cancelled', payload);
+    if (targetUserId) socket.to(targetUserId).emit('call_cancelled', payload);
   });
 
-  socket.on('end_call', (data) => {
+  socket.on('call_timeout', (data) => {
+    const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
+    const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
+
+    const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
+    if (targetEmail) socket.to(targetEmail).emit('call_timed_out', payload);
+    if (targetUserId) socket.to(targetUserId).emit('call_timed_out', payload);
+  });
+
+  const handleCallEnd = (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
 
@@ -295,6 +334,42 @@ io.on('connection', (socket) => {
 
     if (targetEmail) socket.to(targetEmail).emit('call_ended');
     if (targetUserId) socket.to(targetUserId).emit('call_ended');
+  };
+
+  socket.on('end_call', handleCallEnd);
+  socket.on('call_end', handleCallEnd);
+
+  // Direct WebRTC SDP offer, answer, and ice_candidate handlers
+  socket.on('offer', (data) => {
+    const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
+    const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
+    const payload = { offer: data.offer, from: socket.userEmail || socket.userId };
+    if (targetEmail) socket.to(targetEmail).emit('offer', payload);
+    if (targetUserId) socket.to(targetUserId).emit('offer', payload);
+  });
+
+  socket.on('answer', (data) => {
+    const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
+    const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
+    const payload = { answer: data.answer, from: socket.userEmail || socket.userId };
+    if (targetEmail) socket.to(targetEmail).emit('answer', payload);
+    if (targetUserId) socket.to(targetUserId).emit('answer', payload);
+  });
+
+  socket.on('ice_candidate', (data) => {
+    const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
+    const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
+    const payload = { candidate: data.candidate, from: socket.userEmail || socket.userId };
+    if (targetEmail) socket.to(targetEmail).emit('ice_candidate', payload);
+    if (targetUserId) socket.to(targetUserId).emit('ice_candidate', payload);
+  });
+
+  socket.on('connection_state', (data) => {
+    const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
+    const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
+    const payload = { state: data.state, from: socket.userEmail || socket.userId };
+    if (targetEmail) socket.to(targetEmail).emit('connection_state', payload);
+    if (targetUserId) socket.to(targetUserId).emit('connection_state', payload);
   });
 
   socket.on('webrtc_signal', (data) => {
