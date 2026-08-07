@@ -485,7 +485,8 @@ io.on('connection', (socket) => {
     // Notify admins that this cam user went offline
     if (socket.camEmail || socket.userEmail) {
       ADMIN_EMAILS.forEach(adminEmail => {
-        socket.to(adminEmail).emit('cam_user_offline', { socketId: socket.id });
+        io.to(adminEmail).emit('cam_user_offline', { socketId: socket.id });
+        io.to('cam_room_' + adminEmail).emit('cam_user_offline', { socketId: socket.id });
       });
     }
 
