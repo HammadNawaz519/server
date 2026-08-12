@@ -172,6 +172,17 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('react_social_message', (data) => {
+    const { receiverEmail, receiverId, ...reactionData } = data;
+    const targetRoom = receiverEmail ? receiverEmail.toLowerCase().trim() : receiverId ? String(receiverId).trim() : null;
+    if (targetRoom) {
+      socket.to(targetRoom).emit('receive_social_reaction', reactionData);
+    }
+    if (receiverId && String(receiverId).trim() !== targetRoom) {
+      socket.to(String(receiverId).trim()).emit('receive_social_reaction', reactionData);
+    }
+  });
+
   socket.on('change_chat_theme', (data) => {
     const { receiverEmail, receiverId, ...themeData } = data;
     const targetRoom = receiverEmail ? receiverEmail.toLowerCase().trim() : receiverId ? String(receiverId).trim() : null;
