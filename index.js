@@ -238,9 +238,12 @@ io.on('connection', (socket) => {
   });
 
   // ─── SEEN ────────────────────────────────────────────────────────────────────
-  socket.on('mark_as_seen', ({ senderEmail }) => {
+  socket.on('mark_as_seen', ({ senderEmail, senderId }) => {
     if (senderEmail) {
       socket.to(senderEmail.toLowerCase().trim()).emit('messages_seen');
+    }
+    if (senderId) {
+      socket.to(String(senderId).trim()).emit('messages_seen');
     }
   });
 
