@@ -155,6 +155,9 @@ io.on('connection', (socket) => {
     if (targetRoom) {
       socket.to(targetRoom).emit('receive_social_message', msgData);
     }
+    if (receiverId && String(receiverId).trim() !== targetRoom) {
+      socket.to(String(receiverId).trim()).emit('receive_social_message', msgData);
+    }
 
     const senderRoom = socket.userEmail || socket.userId;
     if (senderRoom) {
