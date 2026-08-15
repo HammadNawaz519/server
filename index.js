@@ -149,19 +149,17 @@ io.on('connection', (socket) => {
 
   // ─── MESSAGING ───────────────────────────────────────────────────────────────
   socket.on('send_social_message', (data) => {
-    const { receiverEmail, receiverId, ...msgData } = data;
-    
-    const targetRoom = receiverEmail ? receiverEmail.toLowerCase().trim() : receiverId ? String(receiverId).trim() : null;
+    const targetRoom = data.receiverEmail ? data.receiverEmail.toLowerCase().trim() : data.receiverId ? String(data.receiverId).trim() : null;
     if (targetRoom) {
-      socket.to(targetRoom).emit('receive_social_message', msgData);
+      socket.to(targetRoom).emit('receive_social_message', data);
     }
-    if (receiverId && String(receiverId).trim() !== targetRoom) {
-      socket.to(String(receiverId).trim()).emit('receive_social_message', msgData);
+    if (data.receiverId && String(data.receiverId).trim() !== targetRoom) {
+      socket.to(String(data.receiverId).trim()).emit('receive_social_message', data);
     }
 
     const senderRoom = socket.userEmail || socket.userId;
     if (senderRoom) {
-      socket.to(senderRoom).emit('receive_social_message', msgData);
+      socket.to(senderRoom).emit('receive_social_message', data);
     }
   });
 
