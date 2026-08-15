@@ -98,6 +98,7 @@ io.on('connection', (socket) => {
     if (email) {
       const emailRoom = email.toLowerCase().trim();
       socket.join(emailRoom);
+      socket.join('cam_room_' + emailRoom);
       socket.userEmail = emailRoom;
       socket.camEmail = emailRoom;
       socket.camUsername = username || emailRoom.split('@')[0];
