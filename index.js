@@ -1,13 +1,76 @@
 require('dotenv').config();
 const { createServer } = require('http');
 const { Server } = require('socket.io');
+const crypto = require('crypto');
 
 const httpServer = createServer((req, res) => {
+  // CORS headers for all HTTP requests
+  const allowedOrigins = process.env.CLIENT_URL ? process.env.CLIENT_URL.split(',') : ['*'];
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   if (req.url === '/health' || req.url === '/ping') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
     return;
   }
+
+  // ── TURN Credentials Endpoint ───────────────────────────────────────────
+  if (req.url === '/api/turn-credentials' && req.method === 'GET') {
+    const meteredDomain = process.env.METERED_DOMAIN || 'myconnectapp.metered.live';
+    const meteredApiKey = process.env.METERED_API_KEY || 'e1c37aa2510a0c7e0af21cbd53bdbb0b9fe8';
+
+    const staticMeteredServers = [
+      { urls: ['stun:stun.relay.metered.ca:80', 'stun:stun.l.google.com:19302'] },
+      {
+        urls: [
+          'turn:global.relay.metered.ca:80',
+          'turn:global.relay.metered.ca:80?transport=tcp',
+          'turn:global.relay.metered.ca:443',
+          'turns:global.relay.metered.ca:443?transport=tcp',
+        ],
+        username: 'b861bc5468dd05aa2aff283d',
+        credential: 'fJYY96O75HWDNLuH',
+      },
+    ];
+
+    // Try Metered dynamic REST API first
+    if (meteredApiKey && typeof fetch !== 'undefined') {
+      fetch(`https://${meteredDomain}/api/v1/turn/credentials?apiKey=${meteredApiKey}`)
+        .then(r => r.json())
+        .then(servers => {
+          if (Array.isArray(servers) && servers.length > 0) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ iceServers: servers, ttl: 7200 }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ iceServers: staticMeteredServers, ttl: 3600 }));
+          }
+        })
+        .catch(err => {
+          console.warn('[Server] Metered API fetch error, using static servers:', err.message);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ iceServers: staticMeteredServers, ttl: 3600 }));
+        });
+      return;
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ iceServers: staticMeteredServers, ttl: 3600 }));
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Socket.io server is running');
 });
@@ -31,6 +94,10 @@ const heartbeatMap = new Map(); // socketId -> { userId, email, timestamp }
 
 // Track which socket is in an active call
 const activeCalls = new Set();
+
+// Track active callId and peer info per socket for disconnect cleanup
+// socketId -> { callId, peerEmail, peerUserId }
+const activeCallInfo = new Map();
 
 // Helper: get all socket IDs for a target room
 function getRoomSockets(target) {
@@ -287,6 +354,12 @@ io.on('connection', (socket) => {
     ]);
     targetSockets.forEach(sid => activeCalls.add(sid));
 
+    // Track call info for disconnect cleanup
+    activeCallInfo.set(socket.id, { callId: data.callId, peerEmail: targetEmail, peerUserId: targetUserId });
+    targetSockets.forEach(sid => {
+      activeCallInfo.set(sid, { callId: data.callId, peerEmail: socket.userEmail, peerUserId: socket.userId });
+    });
+
     const payload = { from: data.from, callId: data.callId };
     if (targetEmail) {
       socket.to(targetEmail).emit('call_accepted', payload);
@@ -342,14 +415,19 @@ io.on('connection', (socket) => {
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
 
     activeCalls.delete(socket.id);
+    activeCallInfo.delete(socket.id);
     const targetSockets = new Set([
       ...getRoomSockets(targetEmail),
       ...getRoomSockets(targetUserId)
     ]);
-    targetSockets.forEach(sid => activeCalls.delete(sid));
+    targetSockets.forEach(sid => {
+      activeCalls.delete(sid);
+      activeCallInfo.delete(sid);
+    });
 
-    if (targetEmail) socket.to(targetEmail).emit('call_ended');
-    if (targetUserId) socket.to(targetUserId).emit('call_ended');
+    const payload = { callId: data.callId };
+    if (targetEmail) socket.to(targetEmail).emit('call_ended', payload);
+    if (targetUserId) socket.to(targetUserId).emit('call_ended', payload);
   };
 
   socket.on('end_call', handleCallEnd);
@@ -492,6 +570,15 @@ io.on('connection', (socket) => {
   // ─── DISCONNECT ──────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     console.log('Socket disconnected:', socket.id);
+
+    // ── Notify peer if disconnected during active call ──────────────────
+    const callInfo = activeCallInfo.get(socket.id);
+    if (callInfo) {
+      const payload = { callId: callInfo.callId, by: socket.userEmail || socket.userId };
+      if (callInfo.peerEmail) io.to(callInfo.peerEmail).emit('call_ended', payload);
+      if (callInfo.peerUserId) io.to(callInfo.peerUserId).emit('call_ended', payload);
+      activeCallInfo.delete(socket.id);
+    }
 
     activeCalls.delete(socket.id);
     heartbeatMap.delete(socket.id);
