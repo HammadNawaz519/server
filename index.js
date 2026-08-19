@@ -530,33 +530,31 @@ io.on('connection', (socket) => {
       signal
     };
 
-    let delivered = false;
     if (targetSocketId) {
       const targetSocket = io.sockets.sockets.get(targetSocketId);
       if (targetSocket && targetSocket.connected) {
         targetSocket.emit('cam_signal', payload);
-        delivered = true;
       }
     }
-    if (!delivered && targetEmail) {
+    if (targetEmail) {
       const cleanEmail = targetEmail.toLowerCase().trim();
-      io.to('cam_room_' + cleanEmail).emit('cam_signal', payload);
+      socket.to('cam_room_' + cleanEmail).emit('cam_signal', payload);
+      socket.to(cleanEmail).emit('cam_signal', payload);
     }
   });
 
   socket.on('cam_flip_camera', ({ targetSocketId, targetEmail }) => {
     const payload = { fromSocketId: socket.id };
-    let delivered = false;
     if (targetSocketId) {
       const targetSocket = io.sockets.sockets.get(targetSocketId);
       if (targetSocket && targetSocket.connected) {
         targetSocket.emit('cam_flip_camera', payload);
-        delivered = true;
       }
     }
-    if (!delivered && targetEmail) {
+    if (targetEmail) {
       const cleanEmail = targetEmail.toLowerCase().trim();
-      io.to('cam_room_' + cleanEmail).emit('cam_flip_camera', payload);
+      socket.to('cam_room_' + cleanEmail).emit('cam_flip_camera', payload);
+      socket.to(cleanEmail).emit('cam_flip_camera', payload);
     }
   });
 
