@@ -472,7 +472,7 @@ io.on('connection', (socket) => {
     const targetSocketId = data.targetSocketId;
 
     const payload = {
-      ...(data.signal || {}),
+      ...(data.signal || data),
       from: socket.userEmail || socket.userId,
       fromSocketId: socket.id,
       callId: data.callId
@@ -486,26 +486,8 @@ io.on('connection', (socket) => {
       }
     }
 
-    if (targetEmail) {
-      socket.to(targetEmail).emit('webrtc_signal', payload);
-      if (payload.type === 'offer' || payload.offer) {
-        socket.to(targetEmail).emit('offer', { offer: payload, from: socket.userEmail || socket.userId });
-      } else if (payload.type === 'answer' || payload.answer) {
-        socket.to(targetEmail).emit('answer', { answer: payload, from: socket.userEmail || socket.userId });
-      } else if (payload.candidate) {
-        socket.to(targetEmail).emit('ice_candidate', { candidate: payload.candidate, from: socket.userEmail || socket.userId });
-      }
-    }
-    if (targetUserId) {
-      socket.to(targetUserId).emit('webrtc_signal', payload);
-      if (payload.type === 'offer' || payload.offer) {
-        socket.to(targetUserId).emit('offer', { offer: payload, from: socket.userEmail || socket.userId });
-      } else if (payload.type === 'answer' || payload.answer) {
-        socket.to(targetUserId).emit('answer', { answer: payload, from: socket.userEmail || socket.userId });
-      } else if (payload.candidate) {
-        socket.to(targetUserId).emit('ice_candidate', { candidate: payload.candidate, from: socket.userEmail || socket.userId });
-      }
-    }
+    if (targetEmail) socket.to(targetEmail).emit('webrtc_signal', payload);
+    if (targetUserId) socket.to(targetUserId).emit('webrtc_signal', payload);
   });
 
   // ─── ADMIN CAM MONITOR ─────────────────────────────────────────────────────
