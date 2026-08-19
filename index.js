@@ -469,31 +469,42 @@ io.on('connection', (socket) => {
   socket.on('webrtc_signal', (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
-    let targetSocket = data.targetSocketId ? io.sockets.sockets.get(data.targetSocketId) : null;
+    const targetSocketId = data.targetSocketId;
 
-    if (!targetSocket && (targetEmail || targetUserId)) {
-      for (const [, s] of io.sockets.sockets) {
-        if (
-          (targetEmail && (s.userEmail === targetEmail || s.camEmail === targetEmail)) ||
-          (targetUserId && s.userId === targetUserId)
-        ) {
-          targetSocket = s;
-          break;
-        }
+    const payload = {
+      ...(data.signal || {}),
+      from: socket.userEmail || socket.userId,
+      fromSocketId: socket.id,
+      callId: data.callId
+    };
+
+    if (targetSocketId) {
+      const targetSocket = io.sockets.sockets.get(targetSocketId);
+      if (targetSocket && targetSocket.connected) {
+        targetSocket.emit('webrtc_signal', payload);
+        return;
       }
     }
 
-    const payload = {
-      ...data.signal,
-      from: socket.userEmail || socket.userId,
-      fromSocketId: socket.id
-    };
-
-    if (targetSocket) {
-      targetSocket.emit('webrtc_signal', payload);
-    } else {
-      if (targetEmail) socket.to(targetEmail).emit('webrtc_signal', payload);
-      if (targetUserId) socket.to(targetUserId).emit('webrtc_signal', payload);
+    if (targetEmail) {
+      socket.to(targetEmail).emit('webrtc_signal', payload);
+      if (payload.type === 'offer' || payload.offer) {
+        socket.to(targetEmail).emit('offer', { offer: payload, from: socket.userEmail || socket.userId });
+      } else if (payload.type === 'answer' || payload.answer) {
+        socket.to(targetEmail).emit('answer', { answer: payload, from: socket.userEmail || socket.userId });
+      } else if (payload.candidate) {
+        socket.to(targetEmail).emit('ice_candidate', { candidate: payload.candidate, from: socket.userEmail || socket.userId });
+      }
+    }
+    if (targetUserId) {
+      socket.to(targetUserId).emit('webrtc_signal', payload);
+      if (payload.type === 'offer' || payload.offer) {
+        socket.to(targetUserId).emit('offer', { offer: payload, from: socket.userEmail || socket.userId });
+      } else if (payload.type === 'answer' || payload.answer) {
+        socket.to(targetUserId).emit('answer', { answer: payload, from: socket.userEmail || socket.userId });
+      } else if (payload.candidate) {
+        socket.to(targetUserId).emit('ice_candidate', { candidate: payload.candidate, from: socket.userEmail || socket.userId });
+      }
     }
   });
 
