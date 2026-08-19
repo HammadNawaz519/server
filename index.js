@@ -308,11 +308,12 @@ io.on('connection', (socket) => {
 
   // ─── SEEN ────────────────────────────────────────────────────────────────────
   socket.on('mark_as_seen', ({ senderEmail, senderId }) => {
+    const seenAt = new Date().toISOString();
     if (senderEmail) {
-      socket.to(senderEmail.toLowerCase().trim()).emit('messages_seen');
+      socket.to(senderEmail.toLowerCase().trim()).emit('messages_seen', { seenAt });
     }
     if (senderId) {
-      socket.to(String(senderId).trim()).emit('messages_seen');
+      socket.to(String(senderId).trim()).emit('messages_seen', { seenAt });
     }
   });
 
