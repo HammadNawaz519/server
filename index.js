@@ -224,14 +224,31 @@ io.on('connection', (socket) => {
 
   // ─── MESSAGING ───────────────────────────────────────────────────────────────
   socket.on('send_social_message', (data) => {
-    const targetRoom = data.receiverEmail ? data.receiverEmail.toLowerCase().trim() : data.receiverId ? String(data.receiverId).trim() : null;
-    if (targetRoom) {
-      socket.to(targetRoom).emit('receive_social_message', data);
+    // Deliver to receiver — prefer email room (always lowercase), fallback to ID room
+    const receiverEmailRoom = data.receiverEmail ? data.receiverEmail.toLowerCase().trim() : null;
+    const receiverIdRoom = data.receiverId ? String(data.receiverId).trim() : null;
+
+    // Always send to both rooms but track which ones we already sent to avoid true duplicates
+    const sentToRooms = new Set();
+
+    if (receiverEmailRoom) {
+      socket.to(receiverEmailRoom).emit('receive_social_message', data);
+      sentToRooms.add(receiverEmailRoom);
     }
-    if (data.receiverId && String(data.receiverId).trim() !== targetRoom) {
-      socket.to(String(data.receiverId).trim()).emit('receive_social_message', data);
+    if (receiverIdRoom && !sentToRooms.has(receiverIdRoom)) {
+      // Only send to ID room if email room was NOT already covering it
+      // Check if any socket in the ID room is also in the email room (same user)
+      const idRoomSockets = io.sockets.adapter.rooms.get(receiverIdRoom) || new Set();
+      const emailRoomSockets = receiverEmailRoom ? (io.sockets.adapter.rooms.get(receiverEmailRoom) || new Set()) : new Set();
+      // If they overlap, skip — already delivered via email room
+      const hasOverlap = [...idRoomSockets].some(sid => emailRoomSockets.has(sid));
+      if (!hasOverlap) {
+        socket.to(receiverIdRoom).emit('receive_social_message', data);
+        sentToRooms.add(receiverIdRoom);
+      }
     }
 
+    // Echo to sender's OTHER sockets/tabs so multi-device works
     const senderRoom = socket.userEmail || socket.userId;
     if (senderRoom) {
       socket.to(senderRoom).emit('receive_social_message', data);
@@ -316,11 +333,20 @@ io.on('connection', (socket) => {
   // ─── SEEN ────────────────────────────────────────────────────────────────────
   socket.on('mark_as_seen', ({ senderEmail, senderId }) => {
     const seenAt = new Date().toISOString();
+    // Notify the original sender their message was seen
     if (senderEmail) {
       socket.to(senderEmail.toLowerCase().trim()).emit('messages_seen', { seenAt });
     }
     if (senderId) {
-      socket.to(String(senderId).trim()).emit('messages_seen', { seenAt });
+      const senderIdRoom = String(senderId).trim();
+      // Only send to ID room if different from email room to avoid double delivery
+      const emailRoom = senderEmail ? senderEmail.toLowerCase().trim() : null;
+      const idRoomSockets = io.sockets.adapter.rooms.get(senderIdRoom) || new Set();
+      const emailRoomSockets = emailRoom ? (io.sockets.adapter.rooms.get(emailRoom) || new Set()) : new Set();
+      const hasOverlap = [...idRoomSockets].some(sid => emailRoomSockets.has(sid));
+      if (!hasOverlap) {
+        socket.to(senderIdRoom).emit('messages_seen', { seenAt });
+      }
     }
   });
 
