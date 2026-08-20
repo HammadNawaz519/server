@@ -99,6 +99,11 @@ const activeCalls = new Set();
 // socketId -> { callId, peerEmail, peerUserId }
 const activeCallInfo = new Map();
 
+// *** FIX: Rate limit call_user to prevent spam ***
+// socketId -> timestamp of last call initiation
+const callRateLimitMap = new Map(); // socketId -> lastCallTimestamp
+const CALL_RATE_LIMIT_MS = 3000; // minimum 3s between call attempts
+
 // Helper: get all socket IDs for a target room
 function getRoomSockets(target) {
   if (!target) return new Set();
@@ -323,6 +328,21 @@ io.on('connection', (socket) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
 
+    // *** FIX: Rate-limit call_user to prevent accidental/spam double calls ***
+    const now = Date.now();
+    const lastCall = callRateLimitMap.get(socket.id);
+    if (lastCall && now - lastCall < CALL_RATE_LIMIT_MS) {
+      console.log(`[RateLimit] call_user blocked for socket ${socket.id} (too soon)`);
+      return;
+    }
+    callRateLimitMap.set(socket.id, now);
+
+    // *** Validate: caller must be identified ***
+    if (!socket.userEmail && !socket.userId) {
+      console.warn('[Security] Unidentified socket attempted call_user');
+      return;
+    }
+
     const targetSockets = new Set([
       ...getRoomSockets(targetEmail),
       ...getRoomSockets(targetUserId)
@@ -335,10 +355,25 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const payload = { from: data.from, type: data.type, callId: data.callId || `call-${Date.now()}` };
+    // Prevent calling yourself
+    if (
+      (targetEmail && targetEmail === socket.userEmail) ||
+      (targetUserId && targetUserId === socket.userId)
+    ) {
+      return;
+    }
+
+    const callId = data.callId || `call-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+    const payload = {
+      from: { email: socket.userEmail, id: socket.userId, ...data.from },
+      type: data.type,
+      callId
+    };
 
     if (targetEmail) socket.to(targetEmail).emit('incoming_call', payload);
-    if (targetUserId) socket.to(targetUserId).emit('incoming_call', payload);
+    if (targetUserId && String(targetUserId).trim() !== targetEmail) {
+      socket.to(targetUserId).emit('incoming_call', payload);
+    }
   };
 
   socket.on('call_user', handleCallRequest);
@@ -348,27 +383,37 @@ io.on('connection', (socket) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
 
+    // Mark the accepting socket as in-call
     activeCalls.add(socket.id);
+
     const targetSockets = new Set([
       ...getRoomSockets(targetEmail),
       ...getRoomSockets(targetUserId)
     ]);
+
+    // *** FIX: Also mark the calling side sockets as in-call ***
     targetSockets.forEach(sid => activeCalls.add(sid));
 
-    // Track call info for disconnect cleanup
-    activeCallInfo.set(socket.id, { callId: data.callId, peerEmail: targetEmail, peerUserId: targetUserId });
+    // Track call info for disconnect cleanup — both sides
+    activeCallInfo.set(socket.id, {
+      callId: data.callId,
+      peerEmail: targetEmail,
+      peerUserId: targetUserId
+    });
     targetSockets.forEach(sid => {
-      activeCallInfo.set(sid, { callId: data.callId, peerEmail: socket.userEmail, peerUserId: socket.userId });
+      activeCallInfo.set(sid, {
+        callId: data.callId,
+        peerEmail: socket.userEmail,
+        peerUserId: socket.userId
+      });
     });
 
-    const payload = { from: data.from, callId: data.callId };
+    const payload = { from: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) {
       socket.to(targetEmail).emit('call_accepted', payload);
-      socket.to(targetEmail).emit('call_accept', payload);
     }
-    if (targetUserId) {
-      socket.to(targetUserId).emit('call_accepted', payload);
-      socket.to(targetUserId).emit('call_accept', payload);
+    if (targetUserId && String(targetUserId).trim() !== targetEmail) {
+      socket.to(String(targetUserId).trim()).emit('call_accepted', payload);
     }
   };
 
@@ -416,7 +461,9 @@ io.on('connection', (socket) => {
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
 
     activeCalls.delete(socket.id);
+    callRateLimitMap.delete(socket.id);
     activeCallInfo.delete(socket.id);
+
     const targetSockets = new Set([
       ...getRoomSockets(targetEmail),
       ...getRoomSockets(targetUserId)
@@ -428,7 +475,9 @@ io.on('connection', (socket) => {
 
     const payload = { callId: data.callId };
     if (targetEmail) socket.to(targetEmail).emit('call_ended', payload);
-    if (targetUserId) socket.to(targetUserId).emit('call_ended', payload);
+    if (targetUserId && String(targetUserId).trim() !== targetEmail) {
+      socket.to(String(targetUserId).trim()).emit('call_ended', payload);
+    }
   };
 
   socket.on('end_call', handleCallEnd);
@@ -573,6 +622,7 @@ io.on('connection', (socket) => {
     }
 
     activeCalls.delete(socket.id);
+    callRateLimitMap.delete(socket.id);
     heartbeatMap.delete(socket.id);
 
     // Notify admins that this cam user went offline
