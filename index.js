@@ -127,10 +127,11 @@ function broadcastActivityUpdate(userId, email, isOnline, lastSeen) {
   });
 }
 
-// ─── 60-SECOND SWEEP: detect stale heartbeats (crash/network loss) ──────────
+// ─── 30-SECOND SWEEP: detect stale heartbeats (crash/network loss) ──────────
 setInterval(() => {
   const now = Date.now();
   const STALE_THRESHOLD_MS = 60 * 1000; // 60 seconds
+  let anyCleaned = false;
 
   for (const [socketId, data] of heartbeatMap.entries()) {
     const staleness = now - data.timestamp;
@@ -148,6 +149,7 @@ setInterval(() => {
       });
 
       heartbeatMap.delete(socketId);
+      anyCleaned = true;
 
       // Broadcast offline with the last known heartbeat time as lastSeen
       const lastSeen = new Date(data.timestamp).toISOString();
@@ -155,7 +157,11 @@ setInterval(() => {
       console.log(`[SWEEP] Marked stale socket ${socketId} offline (user: ${email || userId})`);
     }
   }
-}, 60 * 1000);
+
+  if (anyCleaned) {
+    broadcastOnlineUsers();
+  }
+}, 30 * 1000);
 
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
@@ -199,12 +205,8 @@ io.on('connection', (socket) => {
       timestamp: Date.now()
     });
 
-    // Broadcast online status update to all
-    if (changed || socket.justConnected) {
-      broadcastActivityUpdate(socket.userId, socket.userEmail, true, new Date().toISOString());
-    }
-    socket.justConnected = false;
-
+    // Broadcast online status update to all connected clients
+    broadcastActivityUpdate(socket.userId, socket.userEmail, true, new Date().toISOString());
     broadcastOnlineUsers();
     console.log(`User identified: ${socket.userEmail || ''} / ${socket.userId || ''} (${socket.id})`);
   });
