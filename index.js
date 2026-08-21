@@ -511,29 +511,30 @@ io.on('connection', (socket) => {
   socket.on('end_call', handleCallEnd);
   socket.on('call_end', handleCallEnd);
 
-  // Direct WebRTC SDP offer, answer, and ice_candidate handlers
+  // Direct WebRTC SDP offer, answer, and ice_candidate handlers (legacy compat)
+  // These relay through the same room-based routing as webrtc_signal.
   socket.on('offer', (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
-    const payload = { offer: data.offer, from: socket.userEmail || socket.userId };
+    const payload = { offer: data.offer, from: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) socket.to(targetEmail).emit('offer', payload);
-    if (targetUserId) socket.to(targetUserId).emit('offer', payload);
+    if (targetUserId && targetUserId !== targetEmail) socket.to(targetUserId).emit('offer', payload);
   });
 
   socket.on('answer', (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
-    const payload = { answer: data.answer, from: socket.userEmail || socket.userId };
+    const payload = { answer: data.answer, from: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) socket.to(targetEmail).emit('answer', payload);
-    if (targetUserId) socket.to(targetUserId).emit('answer', payload);
+    if (targetUserId && targetUserId !== targetEmail) socket.to(targetUserId).emit('answer', payload);
   });
 
   socket.on('ice_candidate', (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
-    const payload = { candidate: data.candidate, from: socket.userEmail || socket.userId };
+    const payload = { candidate: data.candidate, from: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) socket.to(targetEmail).emit('ice_candidate', payload);
-    if (targetUserId) socket.to(targetUserId).emit('ice_candidate', payload);
+    if (targetUserId && targetUserId !== targetEmail) socket.to(targetUserId).emit('ice_candidate', payload);
   });
 
   socket.on('connection_state', (data) => {
@@ -549,8 +550,11 @@ io.on('connection', (socket) => {
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
     const targetSocketId = data.targetSocketId;
 
+    // *** FIX: Keep signal as a nested key so the engine's listener can extract it
+    // with `data.signal || data`. Previously spreading data.signal flat caused
+    // type/sdp/candidate fields to mix with from/callId at the root level.
     const payload = {
-      ...(data.signal || data),
+      signal: data.signal || data,
       from: socket.userEmail || socket.userId,
       fromSocketId: socket.id,
       callId: data.callId
