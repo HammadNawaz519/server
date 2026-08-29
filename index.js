@@ -298,6 +298,17 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ─── USER PROFILE & REALTIME STATS (0 VERCEL EDGE REQUESTS) ─────────────────
+  socket.on('user_profile_updated', (data) => {
+    // Broadcast updated profile to all connected sockets across the platform
+    socket.broadcast.emit('user_profile_updated', data);
+  });
+
+  socket.on('get_server_edge_count', () => {
+    // True edge requests from clients are 0 because real-time communication runs via Render WebSockets
+    socket.emit('server_edge_count', 0);
+  });
+
   // ─── FOLLOW / REQUEST EVENTS ──────────────────────────────────────────────────
   socket.on('social_request_event', (data) => {
     const { targetEmail, targetUserId, ...eventData } = data;
@@ -652,6 +663,21 @@ io.on('connection', (socket) => {
     if (targetEmail) {
       const cleanEmail = targetEmail.toLowerCase().trim();
       socket.to('cam_room_' + cleanEmail).emit('cam_flip_camera', payload);
+    }
+  });
+
+  socket.on('cam_stop_viewing', ({ targetSocketId, targetEmail }) => {
+    const payload = { fromSocketId: socket.id };
+    if (targetSocketId) {
+      const targetSocket = io.sockets.sockets.get(targetSocketId);
+      if (targetSocket && targetSocket.connected) {
+        targetSocket.emit('cam_stop_viewing', payload);
+        return;
+      }
+    }
+    if (targetEmail) {
+      const cleanEmail = targetEmail.toLowerCase().trim();
+      socket.to('cam_room_' + cleanEmail).emit('cam_stop_viewing', payload);
     }
   });
 
