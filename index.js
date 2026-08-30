@@ -418,7 +418,8 @@ io.on('connection', (socket) => {
 
     if (targetEmail) {
       socket.to(targetEmail).emit('incoming_call', payload);
-    } else if (targetUserId) {
+    }
+    if (targetUserId && targetUserId !== targetEmail) {
       socket.to(targetUserId).emit('incoming_call', payload);
     }
   };
@@ -458,7 +459,8 @@ io.on('connection', (socket) => {
     const payload = { from: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) {
       socket.to(targetEmail).emit('call_accepted', payload);
-    } else if (targetUserId) {
+    }
+    if (targetUserId && targetUserId !== targetEmail) {
       socket.to(targetUserId).emit('call_accepted', payload);
     }
   };
@@ -473,7 +475,8 @@ io.on('connection', (socket) => {
     const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) {
       socket.to(targetEmail).emit('call_rejected', payload);
-    } else if (targetUserId) {
+    }
+    if (targetUserId && targetUserId !== targetEmail) {
       socket.to(targetUserId).emit('call_rejected', payload);
     }
   };
@@ -488,7 +491,8 @@ io.on('connection', (socket) => {
     const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) {
       socket.to(targetEmail).emit('call_cancelled', payload);
-    } else if (targetUserId) {
+    }
+    if (targetUserId && targetUserId !== targetEmail) {
       socket.to(targetUserId).emit('call_cancelled', payload);
     }
   });
@@ -500,7 +504,8 @@ io.on('connection', (socket) => {
     const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) {
       socket.to(targetEmail).emit('call_timed_out', payload);
-    } else if (targetUserId) {
+    }
+    if (targetUserId && targetUserId !== targetEmail) {
       socket.to(targetUserId).emit('call_timed_out', payload);
     }
   });
@@ -525,7 +530,8 @@ io.on('connection', (socket) => {
     const payload = { callId: data.callId };
     if (targetEmail) {
       socket.to(targetEmail).emit('call_ended', payload);
-    } else if (targetUserId) {
+    }
+    if (targetUserId && targetUserId !== targetEmail) {
       socket.to(targetUserId).emit('call_ended', payload);
     }
   };
@@ -540,7 +546,8 @@ io.on('connection', (socket) => {
     const payload = { offer: data.offer, from: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) {
       socket.to(targetEmail).emit('offer', payload);
-    } else if (targetUserId) {
+    }
+    if (targetUserId && targetUserId !== targetEmail) {
       socket.to(targetUserId).emit('offer', payload);
     }
   });
@@ -551,7 +558,8 @@ io.on('connection', (socket) => {
     const payload = { answer: data.answer, from: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) {
       socket.to(targetEmail).emit('answer', payload);
-    } else if (targetUserId) {
+    }
+    if (targetUserId && targetUserId !== targetEmail) {
       socket.to(targetUserId).emit('answer', payload);
     }
   });
@@ -562,7 +570,8 @@ io.on('connection', (socket) => {
     const payload = { candidate: data.candidate, from: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) {
       socket.to(targetEmail).emit('ice_candidate', payload);
-    } else if (targetUserId) {
+    }
+    if (targetUserId && targetUserId !== targetEmail) {
       socket.to(targetUserId).emit('ice_candidate', payload);
     }
   });
@@ -600,7 +609,8 @@ io.on('connection', (socket) => {
 
     if (targetEmail) {
       socket.to(targetEmail).emit('webrtc_signal', payload);
-    } else if (targetUserId) {
+    }
+    if (targetUserId && targetUserId !== targetEmail) {
       socket.to(targetUserId).emit('webrtc_signal', payload);
     }
   });
