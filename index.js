@@ -472,6 +472,18 @@ io.on('connection', (socket) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
 
+    activeCalls.delete(socket.id);
+    activeCallInfo.delete(socket.id);
+
+    const targetSockets = new Set([
+      ...getRoomSockets(targetEmail),
+      ...getRoomSockets(targetUserId)
+    ]);
+    targetSockets.forEach(sid => {
+      activeCalls.delete(sid);
+      activeCallInfo.delete(sid);
+    });
+
     const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) {
       socket.to(targetEmail).emit('call_rejected', payload);
@@ -488,6 +500,18 @@ io.on('connection', (socket) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
 
+    activeCalls.delete(socket.id);
+    activeCallInfo.delete(socket.id);
+
+    const targetSockets = new Set([
+      ...getRoomSockets(targetEmail),
+      ...getRoomSockets(targetUserId)
+    ]);
+    targetSockets.forEach(sid => {
+      activeCalls.delete(sid);
+      activeCallInfo.delete(sid);
+    });
+
     const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) {
       socket.to(targetEmail).emit('call_cancelled', payload);
@@ -500,6 +524,18 @@ io.on('connection', (socket) => {
   socket.on('call_timeout', (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
+
+    activeCalls.delete(socket.id);
+    activeCallInfo.delete(socket.id);
+
+    const targetSockets = new Set([
+      ...getRoomSockets(targetEmail),
+      ...getRoomSockets(targetUserId)
+    ]);
+    targetSockets.forEach(sid => {
+      activeCalls.delete(sid);
+      activeCallInfo.delete(sid);
+    });
 
     const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
     if (targetEmail) {
