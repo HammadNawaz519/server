@@ -89,6 +89,12 @@ const io = new Server(httpServer, {
 // Track online users: identifier -> Set of socket IDs (multiple tabs)
 const onlineUsers = new Map(); // email or userId -> Set<socketId>
 
+// Live server activity / events counter
+let totalServerActivityCount = 1;
+function recordActivity() {
+  totalServerActivityCount++;
+}
+
 // Track per-socket heartbeat timestamp for crash detection
 const heartbeatMap = new Map(); // socketId -> { userId, email, timestamp }
 
@@ -179,7 +185,7 @@ io.on('connection', (socket) => {
       socket.join('cam_room_' + emailRoom);
       socket.userEmail = emailRoom;
       socket.camEmail = emailRoom;
-      socket.camUsername = username || emailRoom.split('@')[0];
+      socket.camUsername = username || 'User';
       if (!onlineUsers.has(emailRoom)) {
         onlineUsers.set(emailRoom, new Set());
         changed = true;
@@ -300,13 +306,14 @@ io.on('connection', (socket) => {
 
   // ─── USER PROFILE & REALTIME STATS (0 VERCEL EDGE REQUESTS) ─────────────────
   socket.on('user_profile_updated', (data) => {
+    recordActivity();
     // Broadcast updated profile to all connected sockets across the platform
     socket.broadcast.emit('user_profile_updated', data);
   });
 
   socket.on('get_server_edge_count', () => {
-    // True edge requests from clients are 0 because real-time communication runs via Render WebSockets
-    socket.emit('server_edge_count', 0);
+    recordActivity();
+    socket.emit('server_edge_count', totalServerActivityCount);
   });
 
   // ─── FOLLOW / REQUEST EVENTS ──────────────────────────────────────────────────
@@ -622,7 +629,7 @@ io.on('connection', (socket) => {
       const email = s.camEmail || s.userEmail;
       if (email) {
         const cleanEmail = email.toLowerCase().trim();
-        const username = s.camUsername || s.username || cleanEmail.split('@')[0];
+        const username = s.camUsername || s.username || 'User';
         if (!userMap.has(cleanEmail)) {
           userMap.set(cleanEmail, { email: cleanEmail, username, socketId: s.id });
         }
