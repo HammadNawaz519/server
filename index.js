@@ -230,34 +230,25 @@ io.on('connection', (socket) => {
 
   // ─── MESSAGING ───────────────────────────────────────────────────────────────
   socket.on('send_social_message', (data) => {
-    // Deliver to receiver — prefer email room (always lowercase), fallback to ID room
+    // Deliver to receiver via email room and ID room
     const receiverEmailRoom = data.receiverEmail ? data.receiverEmail.toLowerCase().trim() : null;
     const receiverIdRoom = data.receiverId ? String(data.receiverId).trim() : null;
 
-    // Always send to both rooms but track which ones we already sent to avoid true duplicates
-    const sentToRooms = new Set();
-
     if (receiverEmailRoom) {
       socket.to(receiverEmailRoom).emit('receive_social_message', data);
-      sentToRooms.add(receiverEmailRoom);
     }
-    if (receiverIdRoom && !sentToRooms.has(receiverIdRoom)) {
-      // Only send to ID room if email room was NOT already covering it
-      // Check if any socket in the ID room is also in the email room (same user)
-      const idRoomSockets = io.sockets.adapter.rooms.get(receiverIdRoom) || new Set();
-      const emailRoomSockets = receiverEmailRoom ? (io.sockets.adapter.rooms.get(receiverEmailRoom) || new Set()) : new Set();
-      // If they overlap, skip — already delivered via email room
-      const hasOverlap = [...idRoomSockets].some(sid => emailRoomSockets.has(sid));
-      if (!hasOverlap) {
-        socket.to(receiverIdRoom).emit('receive_social_message', data);
-        sentToRooms.add(receiverIdRoom);
-      }
+    if (receiverIdRoom && receiverIdRoom !== receiverEmailRoom) {
+      socket.to(receiverIdRoom).emit('receive_social_message', data);
     }
 
-    // Echo to sender's OTHER sockets/tabs so multi-device works
-    const senderRoom = socket.userEmail || socket.userId;
-    if (senderRoom) {
-      socket.to(senderRoom).emit('receive_social_message', data);
+    // Echo to sender's other sockets/tabs
+    const senderEmailRoom = socket.userEmail ? socket.userEmail.toLowerCase().trim() : null;
+    const senderIdRoom = socket.userId ? String(socket.userId).trim() : null;
+    if (senderEmailRoom) {
+      socket.to(senderEmailRoom).emit('receive_social_message', data);
+    }
+    if (senderIdRoom && senderIdRoom !== senderEmailRoom) {
+      socket.to(senderIdRoom).emit('receive_social_message', data);
     }
   });
 
