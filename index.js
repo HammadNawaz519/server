@@ -428,19 +428,18 @@ const httpServer = createServer(async (req, res) => {
   // 5. Global User Search (Indexed Trigram ILIKE search)
   if (pathname === '/api/social/search' && req.method === 'GET') {
     const user = await authenticateRequest(req);
-    if (!user) return sendJson(res, 401, { error: 'Unauthorized' });
+    const myId = user ? user.id : '';
 
     const queryStr = (parsedUrl.searchParams.get('q') || '').trim();
-    if (!queryStr || queryStr.length < 2) return sendJson(res, 200, { users: [] });
+    if (!queryStr) return sendJson(res, 200, { users: [] });
 
     try {
-      const myId = user.id;
       const searchPattern = `%${queryStr.replace(/^@+/, '')}%`;
 
       const { rows } = await pool.query(`
         SELECT id, username, email, image, bio, "lastSeen"
         FROM "User"
-        WHERE id != $1 AND (username ILIKE $2 OR email ILIKE $2)
+        WHERE ($1 = '' OR id != $1) AND (username ILIKE $2 OR email ILIKE $2)
         LIMIT 40
       `, [myId, searchPattern]);
 
