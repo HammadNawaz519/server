@@ -188,8 +188,8 @@ const httpServer = createServer(async (req, res) => {
             "replyToId", "replyToContent", "replyToSenderName", "mediaUrl", "thumbnailUrl", "storagePath"
           FROM "SocialMessage"
           WHERE (
-            ("senderId" = $1 AND "deletedBySender" = false) OR
-            ("receiverId" = $1 AND "deletedByReceiver" = false)
+            ("senderId" = $1 AND ("deletedBySender" IS NOT TRUE)) OR
+            ("receiverId" = $1 AND ("deletedByReceiver" IS NOT TRUE))
           )
           ORDER BY
             CASE WHEN "senderId" = $1 THEN "receiverId" ELSE "senderId" END,
@@ -198,7 +198,7 @@ const httpServer = createServer(async (req, res) => {
         UnseenCounts AS (
           SELECT "senderId" as sender_id, COUNT(*)::int as unseen_count
           FROM "SocialMessage"
-          WHERE "receiverId" = $1 AND "isSeen" = false AND "deletedByReceiver" = false
+          WHERE "receiverId" = $1 AND "isSeen" = false AND ("deletedByReceiver" IS NOT TRUE)
           GROUP BY "senderId"
         )
         SELECT 
@@ -252,10 +252,16 @@ const httpServer = createServer(async (req, res) => {
 
       const nicknames = {};
       nicksRes.rows.forEach(n => {
-        nicknames[n.targetId] = n.nickname;
+        if (n.targetId && n.nickname) {
+          nicknames[n.targetId] = n.nickname;
+        }
       });
 
-      return sendJson(res, 200, { recentChats, activeStories, nicknames });
+      return sendJson(res, 200, {
+        recentChats,
+        activeStories,
+        nicknames
+      });
     } catch (err) {
       console.error('[Render API] /api/social/initial-data error:', err);
       return sendJson(res, 500, { error: 'Failed to load initial social data' });
@@ -269,14 +275,21 @@ const httpServer = createServer(async (req, res) => {
 
     try {
       const myId = user.id;
-      const otherUserId = parsedUrl.searchParams.get('otherUserId');
+      const otherUserIdParam = parsedUrl.searchParams.get('otherUserId');
       const limit = parseInt(parsedUrl.searchParams.get('limit') || '30', 10);
       const beforeId = parsedUrl.searchParams.get('beforeId');
 
-      if (!otherUserId) return sendJson(res, 400, { error: 'otherUserId is required' });
+      if (!otherUserIdParam) return sendJson(res, 400, { error: 'otherUserId is required' });
+
+      // Resolve target ID if email or username was passed
+      const targetUserRes = await pool.query(
+        `SELECT id FROM "User" WHERE id = $1 OR email ILIKE $2 OR username ILIKE $2 LIMIT 1`,
+        [otherUserIdParam, String(otherUserIdParam).trim().toLowerCase()]
+      );
+      const targetId = targetUserRes.rows.length > 0 ? targetUserRes.rows[0].id : otherUserIdParam;
 
       let cursorFilter = '';
-      const params = [myId, otherUserId, limit];
+      const params = [myId, targetId, limit];
 
       if (beforeId) {
         const cursorRow = await pool.query(`SELECT "createdAt" FROM "SocialMessage" WHERE id = $1 LIMIT 1`, [beforeId]);
@@ -293,8 +306,8 @@ const httpServer = createServer(async (req, res) => {
           "mimeType", "fileSize", "width", "height", "duration", "storagePath"
         FROM "SocialMessage"
         WHERE (
-          ("senderId" = $1 AND "receiverId" = $2 AND "deletedBySender" = false) OR
-          ("senderId" = $2 AND "receiverId" = $1 AND "deletedByReceiver" = false)
+          ("senderId" = $1 AND "receiverId" = $2 AND ("deletedBySender" IS NOT TRUE)) OR
+          ("senderId" = $2 AND "receiverId" = $1 AND ("deletedByReceiver" IS NOT TRUE))
         )
         ${cursorFilter}
         ORDER BY "createdAt" DESC
@@ -345,23 +358,33 @@ const httpServer = createServer(async (req, res) => {
         receiverEmail = null
       } = body;
 
+      // Resolve real receiver ID if email or username was passed
+      const targetUserRes = await pool.query(
+        `SELECT id, email, username FROM "User" WHERE id = $1 OR email ILIKE $2 OR username ILIKE $2 LIMIT 1`,
+        [receiverId, String(receiverId).trim().toLowerCase()]
+      );
+      const finalReceiverId = targetUserRes.rows.length > 0 ? targetUserRes.rows[0].id : receiverId;
+      const finalReceiverEmail = targetUserRes.rows.length > 0 ? targetUserRes.rows[0].email : receiverEmail;
+
       const newId = `msg_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
       const now = new Date();
 
       const insertQuery = `
         INSERT INTO "SocialMessage" (
           id, content, type, "senderId", "receiverId", "createdAt", "isSeen",
+          "deletedBySender", "deletedByReceiver",
           "replyToId", "replyToContent", "replyToSenderName", "mediaUrl", "thumbnailUrl",
           "mimeType", "fileSize", "width", "height", "duration", "storagePath"
         ) VALUES (
           $1, $2, $3, $4, $5, $6, false,
+          false, false,
           $7, $8, $9, $10, $11,
           $12, $13, $14, $15, $16, $17
         ) RETURNING *
       `;
 
       const { rows } = await pool.query(insertQuery, [
-        newId, content, type, myId, receiverId, now,
+        newId, content, type, myId, finalReceiverId, now,
         replyToId, replyToContent, replyToSenderName, mediaUrl, thumbnailUrl,
         mimeType, fileSize, width, height, duration, storagePath
       ]);
@@ -372,8 +395,8 @@ const httpServer = createServer(async (req, res) => {
       };
 
       // Broadcast over Socket.IO immediately to receiver and caller's other tabs
-      const receiverEmailRoom = receiverEmail ? receiverEmail.toLowerCase().trim() : null;
-      const receiverIdRoom = String(receiverId).trim();
+      const receiverEmailRoom = finalReceiverEmail ? finalReceiverEmail.toLowerCase().trim() : null;
+      const receiverIdRoom = String(finalReceiverId).trim();
       const senderEmailRoom = user.email ? user.email.toLowerCase().trim() : null;
 
       if (receiverEmailRoom) io.to(receiverEmailRoom).emit('receive_social_message', message);
