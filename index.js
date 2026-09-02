@@ -389,25 +389,80 @@ const httpServer = createServer(async (req, res) => {
         mimeType, fileSize, width, height, duration, storagePath
       ]);
 
+      // Fetch sender profile details to include in the realtime event so recipient immediately has profile info
+      let senderInfo = {
+        id: myId,
+        username: user.username || 'User',
+        email: user.email || ''
+      };
+      try {
+        const senderRow = await pool.query(
+          `SELECT id, username, email, image, bio, "lastSeen", "isOnline" FROM "User" WHERE id = $1 LIMIT 1`,
+          [myId]
+        );
+        if (senderRow.rows.length > 0) {
+          senderInfo = {
+            ...senderInfo,
+            ...senderRow.rows[0],
+            lastSeen: senderRow.rows[0].lastSeen ? new Date(senderRow.rows[0].lastSeen).toISOString() : null
+          };
+        }
+      } catch (e) {}
+
       const message = {
         ...rows[0],
-        createdAt: rows[0].createdAt.toISOString()
+        createdAt: rows[0].createdAt.toISOString(),
+        sender: senderInfo,
+        senderUsername: senderInfo.username,
+        senderEmail: senderInfo.email,
+        senderImage: senderInfo.image,
+        senderBio: senderInfo.bio
       };
 
       // Broadcast over Socket.IO immediately to receiver and caller's other tabs
       const receiverEmailRoom = finalReceiverEmail ? finalReceiverEmail.toLowerCase().trim() : null;
       const receiverIdRoom = String(finalReceiverId).trim();
       const senderEmailRoom = user.email ? user.email.toLowerCase().trim() : null;
+      const senderIdRoom = String(myId).trim();
 
       if (receiverEmailRoom) io.to(receiverEmailRoom).emit('receive_social_message', message);
-      if (receiverIdRoom && receiverIdRoom !== receiverEmailRoom) io.to(receiverIdRoom).emit('receive_social_message', message);
+      if (receiverIdRoom) {
+        io.to(receiverIdRoom).emit('receive_social_message', message);
+        io.to(`user:${receiverIdRoom}`).emit('receive_social_message', message);
+      }
       if (senderEmailRoom) io.to(senderEmailRoom).emit('receive_social_message', message);
-      io.to(String(myId).trim()).emit('receive_social_message', message);
+      if (senderIdRoom) {
+        io.to(senderIdRoom).emit('receive_social_message', message);
+        io.to(`user:${senderIdRoom}`).emit('receive_social_message', message);
+      }
 
       return sendJson(res, 200, { success: true, message });
     } catch (err) {
       console.error('[Render API] send message error:', err);
       return sendJson(res, 500, { error: 'Failed to send message' });
+    }
+  }
+
+  // 3.5. Single User Profile Lookup
+  if (pathname.startsWith('/api/social/user/') && req.method === 'GET') {
+    const user = await authenticateRequest(req);
+    if (!user) return sendJson(res, 401, { error: 'Unauthorized' });
+
+    try {
+      const targetVal = decodeURIComponent(pathname.replace('/api/social/user/', '').trim());
+      const { rows } = await pool.query(
+        `SELECT id, username, email, image, bio, "lastSeen", "isOnline" FROM "User" WHERE id = $1 OR email ILIKE $2 OR username ILIKE $2 LIMIT 1`,
+        [targetVal, targetVal.toLowerCase()]
+      );
+      if (rows.length === 0) return sendJson(res, 404, { error: 'User not found' });
+      const foundUser = {
+        ...rows[0],
+        lastSeen: rows[0].lastSeen ? new Date(rows[0].lastSeen).toISOString() : null
+      };
+      return sendJson(res, 200, { user: foundUser });
+    } catch (err) {
+      console.error('[Render API] /api/social/user error:', err);
+      return sendJson(res, 500, { error: 'Failed to fetch user' });
     }
   }
 
@@ -948,6 +1003,7 @@ io.on('connection', (socket) => {
       socket.userEmail = emailRoom;
       socket.camEmail = emailRoom;
       socket.camUsername = username || 'User';
+      socket.username = username || 'User';
       if (!onlineUsers.has(emailRoom)) onlineUsers.set(emailRoom, new Set());
       onlineUsers.get(emailRoom).add(socket.id);
     }
@@ -955,6 +1011,7 @@ io.on('connection', (socket) => {
     if (userId) {
       const idRoom = String(userId).trim();
       socket.join(idRoom);
+      socket.join(`user:${idRoom}`); // Canonical personal room
       socket.userId = idRoom;
       if (!onlineUsers.has(idRoom)) onlineUsers.set(idRoom, new Set());
       onlineUsers.get(idRoom).add(socket.id);
@@ -984,13 +1041,26 @@ io.on('connection', (socket) => {
     const receiverEmailRoom = data.receiverEmail ? data.receiverEmail.toLowerCase().trim() : null;
     const receiverIdRoom = data.receiverId ? String(data.receiverId).trim() : null;
 
-    if (receiverEmailRoom) socket.to(receiverEmailRoom).emit('receive_social_message', data);
-    if (receiverIdRoom && receiverIdRoom !== receiverEmailRoom) socket.to(receiverIdRoom).emit('receive_social_message', data);
-
     const senderEmailRoom = socket.userEmail ? socket.userEmail.toLowerCase().trim() : null;
     const senderIdRoom = socket.userId ? String(socket.userId).trim() : null;
-    if (senderEmailRoom) socket.to(senderEmailRoom).emit('receive_social_message', data);
-    if (senderIdRoom && senderIdRoom !== senderEmailRoom) socket.to(senderIdRoom).emit('receive_social_message', data);
+
+    // Enrich data with sender identity from socket.identify so receiver can build contact immediately
+    const enriched = {
+      ...data,
+      senderEmail: data.senderEmail || senderEmailRoom || '',
+      senderUsername: data.senderUsername || socket.camUsername || '',
+    };
+
+    if (receiverEmailRoom) socket.to(receiverEmailRoom).emit('receive_social_message', enriched);
+    if (receiverIdRoom) {
+      socket.to(receiverIdRoom).emit('receive_social_message', enriched);
+      socket.to(`user:${receiverIdRoom}`).emit('receive_social_message', enriched);
+    }
+    if (senderEmailRoom) socket.to(senderEmailRoom).emit('receive_social_message', enriched);
+    if (senderIdRoom) {
+      socket.to(senderIdRoom).emit('receive_social_message', enriched);
+      socket.to(`user:${senderIdRoom}`).emit('receive_social_message', enriched);
+    }
   });
 
   socket.on('delete_social_message', (data) => {
