@@ -419,22 +419,11 @@ const httpServer = createServer(async (req, res) => {
         senderBio: senderInfo.bio
       };
 
-      // Broadcast over Socket.IO immediately to receiver and caller's other tabs
-      const receiverEmailRoom = finalReceiverEmail ? finalReceiverEmail.toLowerCase().trim() : null;
-      const receiverIdRoom = String(finalReceiverId).trim();
-      const senderEmailRoom = user.email ? user.email.toLowerCase().trim() : null;
-      const senderIdRoom = String(myId).trim();
-
-      if (receiverEmailRoom) io.to(receiverEmailRoom).emit('receive_social_message', message);
-      if (receiverIdRoom) {
-        io.to(receiverIdRoom).emit('receive_social_message', message);
-        io.to(`user:${receiverIdRoom}`).emit('receive_social_message', message);
-      }
-      if (senderEmailRoom) io.to(senderEmailRoom).emit('receive_social_message', message);
-      if (senderIdRoom) {
-        io.to(senderIdRoom).emit('receive_social_message', message);
-        io.to(`user:${senderIdRoom}`).emit('receive_social_message', message);
-      }
+      // Broadcast once per socket, despite overlapping personal rooms.
+      emitSocialMessageToTargets([
+        { id: finalReceiverId, email: finalReceiverEmail },
+        { id: myId, email: user.email }
+      ], message);
 
       return sendJson(res, 200, { success: true, message });
     } catch (err) {
@@ -924,6 +913,35 @@ const io = new Server(httpServer, {
   }
 });
 
+// A user can be in email, ID, and user:ID rooms. Emit only once per socket.
+function emitSocialMessageToTargets(targets, message, excludeSocketId = null) {
+  const socketIds = new Set();
+
+  for (const target of targets) {
+    if (target?.email) {
+      const emailRoom = String(target.email).toLowerCase().trim();
+      for (const socketId of io.sockets.adapter.rooms.get(emailRoom) || []) {
+        socketIds.add(socketId);
+      }
+    }
+
+    if (target?.id) {
+      const id = String(target.id).trim();
+      for (const room of [id, `user:${id}`]) {
+        for (const socketId of io.sockets.adapter.rooms.get(room) || []) {
+          socketIds.add(socketId);
+        }
+      }
+    }
+  }
+
+  for (const socketId of socketIds) {
+    if (socketId !== excludeSocketId) {
+      io.sockets.sockets.get(socketId)?.emit('receive_social_message', message);
+    }
+  }
+}
+
 // Track online users: identifier -> Set of socket IDs (multiple tabs)
 const onlineUsers = new Map(); // email or userId -> Set<socketId>
 
@@ -1038,29 +1056,21 @@ io.on('connection', (socket) => {
 
   // MESSAGING
   socket.on('send_social_message', (data) => {
-    const receiverEmailRoom = data.receiverEmail ? data.receiverEmail.toLowerCase().trim() : null;
-    const receiverIdRoom = data.receiverId ? String(data.receiverId).trim() : null;
-
     const senderEmailRoom = socket.userEmail ? socket.userEmail.toLowerCase().trim() : null;
-    const senderIdRoom = socket.userId ? String(socket.userId).trim() : null;
 
     // Enrich data with sender identity from socket.identify so receiver can build contact immediately
     const enriched = {
       ...data,
+      senderId: data.senderId || socket.userId,
       senderEmail: data.senderEmail || senderEmailRoom || '',
-      senderUsername: data.senderUsername || socket.camUsername || '',
+      senderUsername: data.senderUsername || socket.username || socket.camUsername || 'User',
+      createdAt: data.createdAt || new Date().toISOString(),
     };
 
-    if (receiverEmailRoom) socket.to(receiverEmailRoom).emit('receive_social_message', enriched);
-    if (receiverIdRoom) {
-      socket.to(receiverIdRoom).emit('receive_social_message', enriched);
-      socket.to(`user:${receiverIdRoom}`).emit('receive_social_message', enriched);
-    }
-    if (senderEmailRoom) socket.to(senderEmailRoom).emit('receive_social_message', enriched);
-    if (senderIdRoom) {
-      socket.to(senderIdRoom).emit('receive_social_message', enriched);
-      socket.to(`user:${senderIdRoom}`).emit('receive_social_message', enriched);
-    }
+    emitSocialMessageToTargets([
+      { id: data.receiverId, email: data.receiverEmail },
+      { id: socket.userId, email: socket.userEmail },
+    ], enriched, socket.id);
   });
 
   socket.on('delete_social_message', (data) => {
