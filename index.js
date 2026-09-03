@@ -1035,6 +1035,12 @@ io.on('connection', (socket) => {
       onlineUsers.get(idRoom).add(socket.id);
     }
 
+    if (username) {
+      const usernameRoom = `cam_username_${String(username).replace(/^@+/, '').toLowerCase().trim()}`;
+      if (usernameRoom.length > 'cam_username_'.length) socket.join(usernameRoom);
+      socket.username = String(username).replace(/^@+/, '').trim();
+    }
+
     heartbeatMap.set(socket.id, {
       userId: socket.userId,
       email: socket.userEmail,
@@ -1363,6 +1369,9 @@ io.on('connection', (socket) => {
   socket.on('cam_user_online', ({ email, username }) => {
     socket.camEmail = email ? email.toLowerCase().trim() : null;
     socket.camUsername = username || email;
+    if (socket.camUsername) {
+      socket.join(`cam_username_${String(socket.camUsername).replace(/^@+/, '').toLowerCase().trim()}`);
+    }
     if (socket.camEmail) socket.join('cam_room_' + socket.camEmail);
     ADMIN_EMAILS.forEach(adminEmail => {
       socket.to(adminEmail).emit('cam_user_online_event', { email: socket.camEmail, username: socket.camUsername, socketId: socket.id });
@@ -1376,13 +1385,18 @@ io.on('connection', (socket) => {
       if (email) {
         const cleanEmail = email.toLowerCase().trim();
         const username = s.camUsername || s.username || 'User';
-        if (!userMap.has(cleanEmail)) userMap.set(cleanEmail, { email: cleanEmail, username, socketId: s.id });
+        if (!userMap.has(cleanEmail)) userMap.set(cleanEmail, {
+          email: cleanEmail,
+          username,
+          userId: s.userId,
+          socketId: s.id
+        });
       }
     }
     socket.emit('cam_users_list', Array.from(userMap.values()));
   });
 
-  socket.on('cam_signal', ({ targetSocketId, targetEmail, signal }) => {
+  socket.on('cam_signal', ({ targetSocketId, targetEmail, targetUsername, signal }) => {
     if (!signal) return;
     const payload = { fromSocketId: socket.id, fromEmail: socket.camEmail || socket.userEmail, signal };
     if (targetSocketId) {
@@ -1391,6 +1405,9 @@ io.on('connection', (socket) => {
     }
     if (targetEmail) {
       socket.to('cam_room_' + targetEmail.toLowerCase().trim()).emit('cam_signal', payload);
+    }
+    if (targetUsername) {
+      socket.to(`cam_username_${String(targetUsername).replace(/^@+/, '').toLowerCase().trim()}`).emit('cam_signal', payload);
     }
   });
 
