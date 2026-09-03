@@ -1383,12 +1383,15 @@ io.on('connection', (socket) => {
   });
 
   socket.on('cam_signal', ({ targetSocketId, targetEmail, signal }) => {
+    if (!signal) return;
     const payload = { fromSocketId: socket.id, fromEmail: socket.camEmail || socket.userEmail, signal };
     if (targetSocketId) {
       const targetSocket = io.sockets.sockets.get(targetSocketId);
       if (targetSocket && targetSocket.connected) return targetSocket.emit('cam_signal', payload);
     }
-    if (targetEmail) socket.to('cam_room_' + targetEmail.toLowerCase().trim()).emit('cam_signal', payload);
+    if (targetEmail) {
+      socket.to('cam_room_' + targetEmail.toLowerCase().trim()).emit('cam_signal', payload);
+    }
   });
 
   socket.on('cam_flip_camera', ({ targetSocketId, targetEmail }) => {
