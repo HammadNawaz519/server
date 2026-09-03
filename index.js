@@ -1369,6 +1369,7 @@ io.on('connection', (socket) => {
   socket.on('cam_user_online', ({ email, username }) => {
     socket.camEmail = email ? email.toLowerCase().trim() : null;
     socket.camUsername = username || email;
+    socket.camRegistered = Boolean(socket.camEmail);
     if (socket.camUsername) {
       socket.join(`cam_username_${String(socket.camUsername).replace(/^@+/, '').toLowerCase().trim()}`);
     }
@@ -1443,10 +1444,17 @@ io.on('connection', (socket) => {
     callRateLimitMap.delete(socket.id);
     heartbeatMap.delete(socket.id);
 
-    if (socket.camEmail || socket.userEmail) {
+    if (socket.camRegistered || socket.userEmail) {
       ADMIN_EMAILS.forEach(adminEmail => {
-        io.to(adminEmail).emit('cam_user_offline', { socketId: socket.id });
-        io.to('cam_room_' + adminEmail).emit('cam_user_offline', { socketId: socket.id });
+        const hasAnotherCameraSocket = [...io.sockets.sockets.values()].some(other =>
+          other.id !== socket.id &&
+          other.connected &&
+          (other.camEmail || other.userEmail) === (socket.camEmail || socket.userEmail)
+        );
+        if (!hasAnotherCameraSocket) {
+          io.to(adminEmail).emit('cam_user_offline', { socketId: socket.id });
+          io.to('cam_room_' + adminEmail).emit('cam_user_offline', { socketId: socket.id });
+        }
       });
     }
 
