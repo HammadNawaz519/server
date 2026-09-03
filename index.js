@@ -1353,20 +1353,8 @@ io.on('connection', (socket) => {
   socket.on('offer', handleWebRTCSignal);
   socket.on('answer', handleWebRTCSignal);
   socket.on('ice_candidate', (data) => {
-    const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
-    const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
-    const candPayload = {
-      signal: { candidate: data.candidate || data },
-      candidate: data.candidate || data,
-      from: socket.userEmail || socket.userId,
-      fromSocketId: socket.id,
-      callId: data.callId
-    };
-    if (targetEmail) socket.to(targetEmail).emit('ice_candidate', candPayload);
-    if (targetUserId) {
-      socket.to(targetUserId).emit('ice_candidate', candPayload);
-      socket.to(`user:${targetUserId}`).emit('ice_candidate', candPayload);
-    }
+    // Legacy clients may still send this event. Route it through the same
+    // unified channel without also emitting a second ICE event.
     handleWebRTCSignal({ ...data, signal: { candidate: data.candidate || data } });
   });
 
