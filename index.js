@@ -915,8 +915,33 @@ const io = new Server(httpServer, {
   }
 });
 
-// A user can be in email, ID, and user:ID/username rooms. Emit only once per socket.
+// Server-side sliding window message deduplication cache
+const recentlyEmittedMessages = new Map(); // messageId -> timestamp
+const MESSAGE_DEDUP_TTL_MS = 10000;
+
+function pruneEmittedMessages() {
+  const now = Date.now();
+  for (const [id, time] of recentlyEmittedMessages.entries()) {
+    if (now - time > MESSAGE_DEDUP_TTL_MS) {
+      recentlyEmittedMessages.delete(id);
+    }
+  }
+}
+setInterval(pruneEmittedMessages, 30000);
+
+// A user can be in email, ID, and user:ID/username rooms. Emit strictly once per socket.
 function emitSocialMessageToTargets(targets, message, excludeSocketId = null) {
+  if (!message) return;
+
+  // Deduplicate by message.id to prevent dual REST API + socket broadcast waves
+  if (message.id) {
+    const msgId = String(message.id);
+    if (recentlyEmittedMessages.has(msgId)) {
+      return; // Already dispatched within the TTL window
+    }
+    recentlyEmittedMessages.set(msgId, Date.now());
+  }
+
   const socketIds = new Set();
   const roomsToTarget = new Set();
 
@@ -949,21 +974,12 @@ function emitSocialMessageToTargets(targets, message, excludeSocketId = null) {
     }
   }
 
+  // Emit strictly once per unique socket to completely eliminate duplicate notifications
   for (const socketId of socketIds) {
     if (socketId !== excludeSocketId) {
       io.sockets.sockets.get(socketId)?.emit('receive_social_message', message);
     }
   }
-
-  // Socket.IO room broadcast fallback (handles all adapter variations cleanly)
-  let broadcaster = io;
-  for (const room of roomsToTarget) {
-    broadcaster = broadcaster.to(room);
-  }
-  if (excludeSocketId) {
-    broadcaster = broadcaster.except(excludeSocketId);
-  }
-  broadcaster.emit('receive_social_message', message);
 }
 
 // Track online users: identifier -> Set of socket IDs (multiple tabs)
@@ -1216,6 +1232,15 @@ io.on('connection', (socket) => {
     }
   };
 
+  // Helper to emit strictly once per unique socket ID (prevents double/triple packet delivery)
+  const emitToSocketsOnce = (socketIdSet, event, payload, excludeId = socket.id) => {
+    for (const sid of socketIdSet) {
+      if (sid !== excludeId) {
+        io.to(sid).emit(event, payload);
+      }
+    }
+  };
+
   const handleCallRequest = (data) => {
     const targetEmail = data.to ? data.to.toLowerCase().trim() : null;
     const targetUserId = data.toUserId ? String(data.toUserId).trim() : null;
@@ -1244,11 +1269,7 @@ io.on('connection', (socket) => {
     const callId = data.callId || `call-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
     const payload = { from: { email: socket.userEmail, id: socket.userId, ...data.from }, type: data.type, callId };
 
-    if (targetEmail) socket.to(targetEmail).emit('incoming_call', payload);
-    if (targetUserId) {
-      socket.to(targetUserId).emit('incoming_call', payload);
-      socket.to(`user:${targetUserId}`).emit('incoming_call', payload);
-    }
+    emitToSocketsOnce(targetSockets, 'incoming_call', payload);
   };
 
   socket.on('call_user', handleCallRequest);
@@ -1272,11 +1293,7 @@ io.on('connection', (socket) => {
     });
 
     const payload = { from: socket.userEmail || socket.userId, callId: data.callId };
-    if (targetEmail) socket.to(targetEmail).emit('call_accepted', payload);
-    if (targetUserId) {
-      socket.to(targetUserId).emit('call_accepted', payload);
-      socket.to(`user:${targetUserId}`).emit('call_accepted', payload);
-    }
+    emitToSocketsOnce(targetSockets, 'call_accepted', payload);
   };
 
   socket.on('accept_call', handleCallAccept);
@@ -1300,11 +1317,7 @@ io.on('connection', (socket) => {
     });
 
     const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
-    if (targetEmail) socket.to(targetEmail).emit('call_rejected', payload);
-    if (targetUserId) {
-      socket.to(targetUserId).emit('call_rejected', payload);
-      socket.to(`user:${targetUserId}`).emit('call_rejected', payload);
-    }
+    emitToSocketsOnce(targetSockets, 'call_rejected', payload);
   };
 
   socket.on('reject_call', handleCallDecline);
@@ -1328,11 +1341,7 @@ io.on('connection', (socket) => {
     });
 
     const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
-    if (targetEmail) socket.to(targetEmail).emit('call_cancelled', payload);
-    if (targetUserId) {
-      socket.to(targetUserId).emit('call_cancelled', payload);
-      socket.to(`user:${targetUserId}`).emit('call_cancelled', payload);
-    }
+    emitToSocketsOnce(targetSockets, 'call_cancelled', payload);
   };
 
   socket.on('call_cancel', handleCallCancel);
@@ -1356,11 +1365,7 @@ io.on('connection', (socket) => {
     });
 
     const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
-    if (targetEmail) socket.to(targetEmail).emit('call_timed_out', payload);
-    if (targetUserId) {
-      socket.to(targetUserId).emit('call_timed_out', payload);
-      socket.to(`user:${targetUserId}`).emit('call_timed_out', payload);
-    }
+    emitToSocketsOnce(targetSockets, 'call_timed_out', payload);
   };
 
   socket.on('call_timeout', handleCallTimeout);
@@ -1385,11 +1390,7 @@ io.on('connection', (socket) => {
     });
 
     const payload = { callId: data.callId };
-    if (targetEmail) socket.to(targetEmail).emit('call_ended', payload);
-    if (targetUserId) {
-      socket.to(targetUserId).emit('call_ended', payload);
-      socket.to(`user:${targetUserId}`).emit('call_ended', payload);
-    }
+    emitToSocketsOnce(targetSockets, 'call_ended', payload);
   };
 
   socket.on('end_call', handleCallEnd);
@@ -1415,11 +1416,12 @@ io.on('connection', (socket) => {
       }
     }
 
-    if (targetEmail) socket.to(targetEmail).emit('webrtc_signal', payload);
-    if (targetUserId) {
-      socket.to(targetUserId).emit('webrtc_signal', payload);
-      socket.to(`user:${targetUserId}`).emit('webrtc_signal', payload);
-    }
+    const targetSockets = new Set([
+      ...getRoomSockets(targetEmail),
+      ...getRoomSockets(targetUserId),
+      ...getRoomSockets(targetUserId ? `user:${targetUserId}` : null)
+    ]);
+    emitToSocketsOnce(targetSockets, 'webrtc_signal', payload);
   };
 
   socket.on('webrtc_signal', handleWebRTCSignal);
@@ -1469,12 +1471,11 @@ io.on('connection', (socket) => {
       const targetSocket = io.sockets.sockets.get(targetSocketId);
       if (targetSocket && targetSocket.connected) return targetSocket.emit('cam_signal', payload);
     }
-    if (targetEmail) {
-      socket.to('cam_room_' + targetEmail.toLowerCase().trim()).emit('cam_signal', payload);
-    }
-    if (targetUsername) {
-      socket.to(`cam_username_${String(targetUsername).replace(/^@+/, '').toLowerCase().trim()}`).emit('cam_signal', payload);
-    }
+    const targetSockets = new Set([
+      ...getRoomSockets(targetEmail ? 'cam_room_' + targetEmail.toLowerCase().trim() : null),
+      ...getRoomSockets(targetUsername ? `cam_username_${String(targetUsername).replace(/^@+/, '').toLowerCase().trim()}` : null)
+    ]);
+    emitToSocketsOnce(targetSockets, 'cam_signal', payload);
   });
 
   socket.on('cam_flip_camera', ({ targetSocketId, targetEmail }) => {
@@ -1500,8 +1501,12 @@ io.on('connection', (socket) => {
     const callInfo = activeCallInfo.get(socket.id);
     if (callInfo) {
       const payload = { callId: callInfo.callId, by: socket.userEmail || socket.userId };
-      if (callInfo.peerEmail) io.to(callInfo.peerEmail).emit('call_ended', payload);
-      if (callInfo.peerUserId) io.to(callInfo.peerUserId).emit('call_ended', payload);
+      const peerSockets = new Set([
+        ...getRoomSockets(callInfo.peerEmail),
+        ...getRoomSockets(callInfo.peerUserId),
+        ...getRoomSockets(callInfo.peerUserId ? `user:${callInfo.peerUserId}` : null)
+      ]);
+      emitToSocketsOnce(peerSockets, 'call_ended', payload);
       activeCallInfo.delete(socket.id);
     }
 
