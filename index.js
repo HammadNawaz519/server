@@ -1175,6 +1175,14 @@ io.on('connection', (socket) => {
     socket.broadcast.emit('user_profile_updated', data);
   });
 
+  socket.on('like_profile', (data) => {
+    recordActivity();
+    socket.broadcast.emit('profile_liked', data);
+    if (data?.targetUserId) {
+      socket.to(String(data.targetUserId).trim()).emit('profile_liked_notification', data);
+    }
+  });
+
   socket.on('get_server_edge_count', () => {
     recordActivity();
     socket.emit('server_edge_count', totalServerActivityCount);
