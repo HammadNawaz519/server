@@ -177,39 +177,46 @@ const httpServer = createServer(async (req, res) => {
       const myId = user.id;
       const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
+      const myEmail = (user.email || '').toLowerCase().trim();
       // A. Recent chats with last message and unseen count
       const chatsQuery = pool.query(`
-        WITH RecentMsgs AS (
-          SELECT DISTINCT ON (
-            CASE WHEN "senderId" = $1 THEN "receiverId" ELSE "senderId" END
-          )
-            CASE WHEN "senderId" = $1 THEN "receiverId" ELSE "senderId" END as other_user_id,
+        WITH RankedMsgs AS (
+          SELECT
             id, content, type, "createdAt", "senderId", "receiverId", "isSeen",
-            "replyToId", "replyToContent", "replyToSenderName", "mediaUrl", "thumbnailUrl", "storagePath"
+            "replyToId", "replyToContent", "replyToSenderName", "mediaUrl", "thumbnailUrl", "storagePath",
+            CASE WHEN ("senderId" = $1 OR "senderId" ILIKE $2) THEN "receiverId" ELSE "senderId" END as other_user_id
           FROM "SocialMessage"
           WHERE (
-            ("senderId" = $1 AND ("deletedBySender" IS NOT TRUE)) OR
-            ("receiverId" = $1 AND ("deletedByReceiver" IS NOT TRUE))
+            (("senderId" = $1 OR "senderId" ILIKE $2) AND ("deletedBySender" IS NOT TRUE)) OR
+            (("receiverId" = $1 OR "receiverId" ILIKE $2) AND ("deletedByReceiver" IS NOT TRUE))
           )
-          ORDER BY
-            CASE WHEN "senderId" = $1 THEN "receiverId" ELSE "senderId" END,
-            "createdAt" DESC
+        ),
+        MatchedUsers AS (
+          SELECT 
+            rm.*,
+            u.id as matched_user_id, u.username, u.email as user_email, u.image, u.bio, u."lastSeen" as last_seen, u."isOnline" as is_online,
+            ROW_NUMBER() OVER(PARTITION BY u.id ORDER BY rm."createdAt" DESC) as rn
+          FROM RankedMsgs rm
+          JOIN "User" u ON (u.id = rm.other_user_id OR u.email ILIKE rm.other_user_id)
         ),
         UnseenCounts AS (
-          SELECT "senderId" as sender_id, COUNT(*)::int as unseen_count
-          FROM "SocialMessage"
-          WHERE "receiverId" = $1 AND "isSeen" = false AND ("deletedByReceiver" IS NOT TRUE)
-          GROUP BY "senderId"
+          SELECT 
+            CASE WHEN u.id IS NOT NULL THEN u.id ELSE sm."senderId" END as sender_user_id,
+            COUNT(*)::int as unseen_count
+          FROM "SocialMessage" sm
+          LEFT JOIN "User" u ON (u.id = sm."senderId" OR u.email ILIKE sm."senderId")
+          WHERE (sm."receiverId" = $1 OR sm."receiverId" ILIKE $2) AND sm."isSeen" = false AND (sm."deletedByReceiver" IS NOT TRUE)
+          GROUP BY 1
         )
         SELECT 
-          rm.id as msg_id, rm.content, rm.type, rm."createdAt" as msg_created_at, rm."senderId" as msg_sender_id,
-          u.id as user_id, u.username, u.email, u.image, u.bio, u."lastSeen" as last_seen, u."isOnline" as is_online,
+          mu.id as msg_id, mu.content, mu.type, mu."createdAt" as msg_created_at, mu."senderId" as msg_sender_id,
+          mu.matched_user_id as user_id, mu.username, mu.user_email as email, mu.image, mu.bio, mu.last_seen, mu.is_online,
           COALESCE(uc.unseen_count, 0) as unseen_count
-        FROM RecentMsgs rm
-        JOIN "User" u ON u.id = rm.other_user_id
-        LEFT JOIN UnseenCounts uc ON uc.sender_id = u.id
-        ORDER BY rm."createdAt" DESC
-      `, [myId]);
+        FROM MatchedUsers mu
+        LEFT JOIN UnseenCounts uc ON uc.sender_user_id = mu.matched_user_id
+        WHERE mu.rn = 1
+        ORDER BY mu."createdAt" DESC
+      `, [myId, myEmail]);
 
       // B. Active 24-hour stories
       const storiesQuery = pool.query(`
@@ -592,7 +599,7 @@ const httpServer = createServer(async (req, res) => {
           name = COALESCE($1, name),
           bio = COALESCE($2, bio),
           website = COALESCE($3, website),
-          image = COALESCE($4, image),
+          image = CASE WHEN $4 = '__REMOVE__' OR $4 = '' THEN NULL WHEN $4 IS NOT NULL THEN $4 ELSE image END,
           phone = COALESCE($5, phone),
           "isPrivate" = COALESCE($6, "isPrivate")
         WHERE id = $7
