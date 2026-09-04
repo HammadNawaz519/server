@@ -1178,9 +1178,15 @@ io.on('connection', (socket) => {
   socket.on('like_profile', (data) => {
     recordActivity();
     socket.broadcast.emit('profile_liked', data);
-    if (data?.targetUserId) {
-      socket.to(String(data.targetUserId).trim()).emit('profile_liked_notification', data);
-    }
+    const targetUserId = data?.targetUserId ? String(data.targetUserId).trim() : null;
+    const targetEmail = data?.targetEmail ? String(data.targetEmail).toLowerCase().trim() : null;
+    const targetSockets = new Set([
+      ...getRoomSockets(targetUserId),
+      ...getRoomSockets(targetUserId ? `user:${targetUserId}` : null),
+      ...getRoomSockets(targetEmail),
+      ...getRoomSockets(targetEmail ? `user:${targetEmail}` : null),
+    ]);
+    emitToSocketsOnce(targetSockets, 'profile_liked_notification', data);
   });
 
   socket.on('get_server_edge_count', () => {
