@@ -1200,9 +1200,6 @@ io.on('connection', (socket) => {
   });
 
   // CALLS & WEBRTC
-  // Helper to emit a signaling event to a target peer across their email, userId, and user:userId rooms.
-  // Chaining .to() in Socket.IO unions target sockets, guaranteeing each physical client socket receives
-  // the event EXACTLY ONCE (prevents choking low-bandwidth mobile connections with duplicated ICE/SDP packets).
   const emitToCallTarget = (targetEmail, targetUserId, event, payload, targetSocketId) => {
     if (targetSocketId) {
       const targetSocket = io.sockets.sockets.get(targetSocketId);
@@ -1211,21 +1208,12 @@ io.on('connection', (socket) => {
         return;
       }
     }
-
-    const rooms = new Set();
-    if (targetEmail) rooms.add(targetEmail.toLowerCase().trim());
+    if (targetEmail) socket.to(targetEmail.toLowerCase().trim()).emit(event, payload);
     if (targetUserId) {
       const idStr = String(targetUserId).trim();
-      rooms.add(idStr);
-      rooms.add(`user:${idStr}`);
+      socket.to(idStr).emit(event, payload);
+      socket.to(`user:${idStr}`).emit(event, payload);
     }
-    if (rooms.size === 0) return;
-
-    let broadcaster = socket;
-    for (const room of rooms) {
-      broadcaster = broadcaster.to(room);
-    }
-    broadcaster.emit(event, payload);
   };
 
   const handleCallRequest = (data) => {
@@ -1256,7 +1244,11 @@ io.on('connection', (socket) => {
     const callId = data.callId || `call-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
     const payload = { from: { email: socket.userEmail, id: socket.userId, ...data.from }, type: data.type, callId };
 
-    emitToCallTarget(targetEmail, targetUserId, 'incoming_call', payload);
+    if (targetEmail) socket.to(targetEmail).emit('incoming_call', payload);
+    if (targetUserId) {
+      socket.to(targetUserId).emit('incoming_call', payload);
+      socket.to(`user:${targetUserId}`).emit('incoming_call', payload);
+    }
   };
 
   socket.on('call_user', handleCallRequest);
@@ -1280,7 +1272,11 @@ io.on('connection', (socket) => {
     });
 
     const payload = { from: socket.userEmail || socket.userId, callId: data.callId };
-    emitToCallTarget(targetEmail, targetUserId, 'call_accepted', payload);
+    if (targetEmail) socket.to(targetEmail).emit('call_accepted', payload);
+    if (targetUserId) {
+      socket.to(targetUserId).emit('call_accepted', payload);
+      socket.to(`user:${targetUserId}`).emit('call_accepted', payload);
+    }
   };
 
   socket.on('accept_call', handleCallAccept);
@@ -1304,7 +1300,11 @@ io.on('connection', (socket) => {
     });
 
     const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
-    emitToCallTarget(targetEmail, targetUserId, 'call_rejected', payload);
+    if (targetEmail) socket.to(targetEmail).emit('call_rejected', payload);
+    if (targetUserId) {
+      socket.to(targetUserId).emit('call_rejected', payload);
+      socket.to(`user:${targetUserId}`).emit('call_rejected', payload);
+    }
   };
 
   socket.on('reject_call', handleCallDecline);
@@ -1328,7 +1328,11 @@ io.on('connection', (socket) => {
     });
 
     const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
-    emitToCallTarget(targetEmail, targetUserId, 'call_cancelled', payload);
+    if (targetEmail) socket.to(targetEmail).emit('call_cancelled', payload);
+    if (targetUserId) {
+      socket.to(targetUserId).emit('call_cancelled', payload);
+      socket.to(`user:${targetUserId}`).emit('call_cancelled', payload);
+    }
   };
 
   socket.on('call_cancel', handleCallCancel);
@@ -1352,7 +1356,11 @@ io.on('connection', (socket) => {
     });
 
     const payload = { by: socket.userEmail || socket.userId, callId: data.callId };
-    emitToCallTarget(targetEmail, targetUserId, 'call_timed_out', payload);
+    if (targetEmail) socket.to(targetEmail).emit('call_timed_out', payload);
+    if (targetUserId) {
+      socket.to(targetUserId).emit('call_timed_out', payload);
+      socket.to(`user:${targetUserId}`).emit('call_timed_out', payload);
+    }
   };
 
   socket.on('call_timeout', handleCallTimeout);
@@ -1377,7 +1385,11 @@ io.on('connection', (socket) => {
     });
 
     const payload = { callId: data.callId };
-    emitToCallTarget(targetEmail, targetUserId, 'call_ended', payload);
+    if (targetEmail) socket.to(targetEmail).emit('call_ended', payload);
+    if (targetUserId) {
+      socket.to(targetUserId).emit('call_ended', payload);
+      socket.to(`user:${targetUserId}`).emit('call_ended', payload);
+    }
   };
 
   socket.on('end_call', handleCallEnd);
@@ -1395,15 +1407,25 @@ io.on('connection', (socket) => {
       callId: data.callId
     };
 
-    emitToCallTarget(targetEmail, targetUserId, 'webrtc_signal', payload, targetSocketId);
+    if (targetSocketId) {
+      const targetSocket = io.sockets.sockets.get(targetSocketId);
+      if (targetSocket && targetSocket.connected) {
+        targetSocket.emit('webrtc_signal', payload);
+        return;
+      }
+    }
+
+    if (targetEmail) socket.to(targetEmail).emit('webrtc_signal', payload);
+    if (targetUserId) {
+      socket.to(targetUserId).emit('webrtc_signal', payload);
+      socket.to(`user:${targetUserId}`).emit('webrtc_signal', payload);
+    }
   };
 
   socket.on('webrtc_signal', handleWebRTCSignal);
   socket.on('offer', handleWebRTCSignal);
   socket.on('answer', handleWebRTCSignal);
   socket.on('ice_candidate', (data) => {
-    // Legacy clients may still send this event. Route it through the same
-    // unified channel without also emitting a second ICE event.
     handleWebRTCSignal({ ...data, signal: { candidate: data.candidate || data } });
   });
 
@@ -1418,7 +1440,7 @@ io.on('connection', (socket) => {
     }
     if (socket.camEmail) socket.join('cam_room_' + socket.camEmail);
     ADMIN_EMAILS.forEach(adminEmail => {
-      socket.to(adminEmail).to('cam_room_' + adminEmail).emit('cam_user_online_event', { email: socket.camEmail, username: socket.camUsername, socketId: socket.id });
+      socket.to(adminEmail).emit('cam_user_online_event', { email: socket.camEmail, username: socket.camUsername, socketId: socket.id });
     });
   });
 
@@ -1447,13 +1469,12 @@ io.on('connection', (socket) => {
       const targetSocket = io.sockets.sockets.get(targetSocketId);
       if (targetSocket && targetSocket.connected) return targetSocket.emit('cam_signal', payload);
     }
-    const rooms = new Set();
-    if (targetEmail) rooms.add('cam_room_' + targetEmail.toLowerCase().trim());
-    if (targetUsername) rooms.add(`cam_username_${String(targetUsername).replace(/^@+/, '').toLowerCase().trim()}`);
-    if (rooms.size === 0) return;
-    let b = socket;
-    for (const r of rooms) b = b.to(r);
-    b.emit('cam_signal', payload);
+    if (targetEmail) {
+      socket.to('cam_room_' + targetEmail.toLowerCase().trim()).emit('cam_signal', payload);
+    }
+    if (targetUsername) {
+      socket.to(`cam_username_${String(targetUsername).replace(/^@+/, '').toLowerCase().trim()}`).emit('cam_signal', payload);
+    }
   });
 
   socket.on('cam_flip_camera', ({ targetSocketId, targetEmail }) => {
@@ -1479,18 +1500,8 @@ io.on('connection', (socket) => {
     const callInfo = activeCallInfo.get(socket.id);
     if (callInfo) {
       const payload = { callId: callInfo.callId, by: socket.userEmail || socket.userId };
-      const rooms = new Set();
-      if (callInfo.peerEmail) rooms.add(callInfo.peerEmail.toLowerCase().trim());
-      if (callInfo.peerUserId) {
-        const idStr = String(callInfo.peerUserId).trim();
-        rooms.add(idStr);
-        rooms.add(`user:${idStr}`);
-      }
-      if (rooms.size > 0) {
-        let b = io;
-        for (const r of rooms) b = b.to(r);
-        b.emit('call_ended', payload);
-      }
+      if (callInfo.peerEmail) io.to(callInfo.peerEmail).emit('call_ended', payload);
+      if (callInfo.peerUserId) io.to(callInfo.peerUserId).emit('call_ended', payload);
       activeCallInfo.delete(socket.id);
     }
 
@@ -1506,7 +1517,8 @@ io.on('connection', (socket) => {
           (other.camEmail || other.userEmail) === (socket.camEmail || socket.userEmail)
         );
         if (!hasAnotherCameraSocket) {
-          io.to(adminEmail).to('cam_room_' + adminEmail).emit('cam_user_offline', { socketId: socket.id });
+          io.to(adminEmail).emit('cam_user_offline', { socketId: socket.id });
+          io.to('cam_room_' + adminEmail).emit('cam_user_offline', { socketId: socket.id });
         }
       });
     }
