@@ -427,12 +427,13 @@ const httpServer = createServer(async (req, res) => {
         senderBio: senderInfo.bio
       };
 
-      // Broadcast once per socket across all potential recipient identifiers
+      // Broadcast to receiver only — sender already has message from REST response.
+      // Pass sender userId to exclude sender's own sockets from this broadcast,
+      // since the sender's socket.emit('send_social_message') will deliver to their other tabs.
       emitSocialMessageToTargets([
         { id: finalReceiverId, email: finalReceiverEmail, username: finalReceiverUsername },
         { id: receiverId, email: receiverEmail },
-        { id: myId, email: user.email, username: user.username }
-      ], message);
+      ], message, null, myId);
 
       return sendJson(res, 200, { success: true, message });
     } catch (err) {
@@ -510,20 +511,27 @@ const httpServer = createServer(async (req, res) => {
     if (!queryStr) return sendJson(res, 200, { users: [] });
 
     try {
-      const searchPattern = `%${queryStr.replace(/^@+/, '')}%`;
+      const rawQ = queryStr.replace(/^@+/, '').trim();
+      const startsPattern = `${rawQ}%`;
 
       const { rows } = await pool.query(`
         SELECT id, username, email, image, bio, "lastSeen"
         FROM "User"
-        WHERE ($1 = '' OR id != $1) AND (username ILIKE $2 OR email ILIKE $2)
+        WHERE ($1 = '' OR id != $1) AND (username ILIKE $2)
+        ORDER BY
+          CASE
+            WHEN username ILIKE $3 THEN 1
+            ELSE 2
+          END,
+          username ASC
         LIMIT 40
-      `, [myId, searchPattern]);
+      `, [myId, startsPattern, rawQ]);
 
       const users = rows.map(u => ({
         id: u.id,
         username: u.username,
         email: u.email,
-        image: u.image,
+        image: u.image || '',
         bio: u.bio,
         lastSeen: u.lastSeen ? new Date(u.lastSeen).toISOString() : null
       }));
@@ -922,32 +930,11 @@ const io = new Server(httpServer, {
   }
 });
 
-// Server-side sliding window message deduplication cache
-const recentlyEmittedMessages = new Map(); // messageId -> timestamp
-const MESSAGE_DEDUP_TTL_MS = 10000;
-
-function pruneEmittedMessages() {
-  const now = Date.now();
-  for (const [id, time] of recentlyEmittedMessages.entries()) {
-    if (now - time > MESSAGE_DEDUP_TTL_MS) {
-      recentlyEmittedMessages.delete(id);
-    }
-  }
-}
-setInterval(pruneEmittedMessages, 30000);
-
 // A user can be in email, ID, and user:ID/username rooms. Emit strictly once per socket.
-function emitSocialMessageToTargets(targets, message, excludeSocketId = null) {
+// excludeSocketId: skip a specific socket (e.g. the sender's current tab)
+// excludeUserId: skip ALL sockets belonging to a user (e.g. sender from REST broadcast)
+function emitSocialMessageToTargets(targets, message, excludeSocketId = null, excludeUserId = null) {
   if (!message) return;
-
-  // Deduplicate by message.id to prevent dual REST API + socket broadcast waves
-  if (message.id) {
-    const msgId = String(message.id);
-    if (recentlyEmittedMessages.has(msgId)) {
-      return; // Already dispatched within the TTL window
-    }
-    recentlyEmittedMessages.set(msgId, Date.now());
-  }
 
   const socketIds = new Set();
   const roomsToTarget = new Set();
@@ -981,9 +968,28 @@ function emitSocialMessageToTargets(targets, message, excludeSocketId = null) {
     }
   }
 
+  // Build set of socket IDs to exclude when excludeUserId is specified
+  const excludedSocketIds = new Set();
+  if (excludeSocketId) excludedSocketIds.add(excludeSocketId);
+  if (excludeUserId) {
+    const uid = String(excludeUserId).trim();
+    // Sender may be in rooms keyed by userId, email, or username — collect all their sockets
+    for (const room of [uid, `user:${uid}`]) {
+      for (const sid of io.sockets.adapter.rooms.get(room) || []) {
+        excludedSocketIds.add(sid);
+      }
+    }
+    // Also check by socket.userId property
+    for (const [sid, s] of io.sockets.sockets) {
+      if (s.userId && String(s.userId).trim() === uid) {
+        excludedSocketIds.add(sid);
+      }
+    }
+  }
+
   // Emit strictly once per unique socket to completely eliminate duplicate notifications
   for (const socketId of socketIds) {
-    if (socketId !== excludeSocketId) {
+    if (!excludedSocketIds.has(socketId)) {
       io.sockets.sockets.get(socketId)?.emit('receive_social_message', message);
     }
   }
@@ -1194,6 +1200,20 @@ io.on('connection', (socket) => {
       ...getRoomSockets(targetEmail ? `user:${targetEmail}` : null),
     ]);
     emitToSocketsOnce(targetSockets, 'profile_liked_notification', data);
+  });
+
+  socket.on('follow_user', (data) => {
+    recordActivity();
+    socket.broadcast.emit('user_followed', data);
+    const targetUserId = data?.targetUserId ? String(data.targetUserId).trim() : null;
+    const targetEmail = data?.targetEmail ? String(data.targetEmail).toLowerCase().trim() : null;
+    const targetSockets = new Set([
+      ...getRoomSockets(targetUserId),
+      ...getRoomSockets(targetUserId ? `user:${targetUserId}` : null),
+      ...getRoomSockets(targetEmail),
+      ...getRoomSockets(targetEmail ? `user:${targetEmail}` : null),
+    ]);
+    emitToSocketsOnce(targetSockets, 'user_followed_notification', data);
   });
 
   socket.on('get_server_edge_count', () => {
