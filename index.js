@@ -6,9 +6,11 @@ const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 
 // ── Database Connection Pool ────────────────────────────────────────────────
+const DEFAULT_DATABASE_URL = "postgresql://postgres.nqrvnhldfbtvxlfqtray:Hammad519..@aws-0-us-east-1.pooler.supabase.com:6543/postgres?pgbouncer=true&sslmode=require";
 let pool = null;
-if (process.env.DATABASE_URL) {
-  let dbUrl = process.env.DATABASE_URL;
+const rawDbUrl = process.env.DATABASE_URL || DEFAULT_DATABASE_URL;
+if (rawDbUrl) {
+  let dbUrl = rawDbUrl;
   if (dbUrl.includes('sslmode=')) {
     dbUrl = dbUrl.replace(/sslmode=[^&]+/, 'sslmode=no-verify');
   }
@@ -50,7 +52,8 @@ function parseJsonBody(req) {
 async function authenticateRequest(req) {
   try {
     const authHeader = req.headers['authorization'] || '';
-    const customUserHeader = req.headers['x-user-id'] || req.headers['x-user-email'];
+    const userIdHeader = req.headers['x-user-id'];
+    const userEmailHeader = req.headers['x-user-email'];
 
     // 1. Try Bearer JWT Token
     if (authHeader.startsWith('Bearer ')) {
@@ -68,18 +71,27 @@ async function authenticateRequest(req) {
       } catch (e) {}
     }
 
-    // 2. Fallback to authenticated User ID Header if provided with secret or internal handshake
-    if (customUserHeader && pool) {
-      const lookupVal = String(customUserHeader).trim();
+    // 2. Authenticated User ID / Email Headers
+    if ((userIdHeader || userEmailHeader) && pool) {
+      const idVal = userIdHeader ? String(userIdHeader).trim() : '';
+      const emailVal = userEmailHeader ? String(userEmailHeader).trim().toLowerCase() : '';
       const { rows } = await pool.query(
-        `SELECT id, email, username FROM "User" WHERE id = $1 OR email = $2 LIMIT 1`,
-        [lookupVal, lookupVal.toLowerCase()]
+        `SELECT id, email, username FROM "User" WHERE id = $1 OR email = $2 OR (id = $2 AND $2 <> '') OR (email = $1 AND $1 <> '') LIMIT 1`,
+        [idVal || emailVal, emailVal || idVal]
       );
       if (rows.length > 0) {
         return {
           id: rows[0].id,
           email: (rows[0].email || '').toLowerCase().trim(),
           username: rows[0].username || 'User'
+        };
+      }
+      // If user header provided but not found yet in DB (fallback identity)
+      if (idVal || emailVal) {
+        return {
+          id: idVal || emailVal,
+          email: emailVal || '',
+          username: emailVal ? emailVal.split('@')[0] : 'User'
         };
       }
     }
@@ -282,27 +294,34 @@ const httpServer = createServer(async (req, res) => {
 
     try {
       const myId = user.id;
+      const myEmail = (user.email || '').toLowerCase().trim();
       const otherUserIdParam = parsedUrl.searchParams.get('otherUserId');
-      const limit = parseInt(parsedUrl.searchParams.get('limit') || '30', 10);
+      const limit = Math.min(Math.max(parseInt(parsedUrl.searchParams.get('limit') || '30', 10), 1), 100);
       const beforeId = parsedUrl.searchParams.get('beforeId');
 
       if (!otherUserIdParam) return sendJson(res, 400, { error: 'otherUserId is required' });
 
-      // Resolve target ID if email or username was passed
+      // Resolve target ID & email if username, email, or ID was passed
+      const cleanParam = String(otherUserIdParam).trim();
       const targetUserRes = await pool.query(
-        `SELECT id FROM "User" WHERE id = $1 OR email ILIKE $2 OR username ILIKE $2 LIMIT 1`,
-        [otherUserIdParam, String(otherUserIdParam).trim().toLowerCase()]
+        `SELECT id, email, username FROM "User" WHERE id = $1 OR email ILIKE $2 OR username ILIKE $2 LIMIT 1`,
+        [cleanParam, cleanParam.toLowerCase()]
       );
-      const targetId = targetUserRes.rows.length > 0 ? targetUserRes.rows[0].id : otherUserIdParam;
+      const targetId = targetUserRes.rows.length > 0 ? targetUserRes.rows[0].id : cleanParam;
+      const targetEmail = targetUserRes.rows.length > 0 ? (targetUserRes.rows[0].email || '').toLowerCase().trim() : cleanParam.toLowerCase();
 
       let cursorFilter = '';
-      const params = [myId, targetId, limit];
+      const params = [myId, myEmail, targetId, targetEmail, limit];
 
       if (beforeId) {
-        const cursorRow = await pool.query(`SELECT "createdAt" FROM "SocialMessage" WHERE id = $1 LIMIT 1`, [beforeId]);
+        const cursorRow = await pool.query(`SELECT "createdAt", id FROM "SocialMessage" WHERE id = $1 LIMIT 1`, [beforeId]);
         if (cursorRow.rows.length > 0) {
           params.push(cursorRow.rows[0].createdAt);
-          cursorFilter = `AND "createdAt" < $4`;
+          params.push(cursorRow.rows[0].id);
+          cursorFilter = `AND ("createdAt" < $6 OR ("createdAt" = $6 AND id < $7))`;
+        } else {
+          // Cursor message not found - return empty page so client terminates pagination cleanly
+          return sendJson(res, 200, { messages: [] });
         }
       }
 
@@ -313,19 +332,55 @@ const httpServer = createServer(async (req, res) => {
           "mimeType", "fileSize", "width", "height", "duration", "storagePath"
         FROM "SocialMessage"
         WHERE (
-          ("senderId" = $1 AND "receiverId" = $2 AND ("deletedBySender" IS NOT TRUE)) OR
-          ("senderId" = $2 AND "receiverId" = $1 AND ("deletedByReceiver" IS NOT TRUE))
+          (
+            ("senderId" = $1 OR "senderId" ILIKE $2) AND
+            ("receiverId" = $3 OR "receiverId" ILIKE $4) AND
+            ("deletedBySender" IS NOT TRUE)
+          ) OR (
+            ("senderId" = $3 OR "senderId" ILIKE $4) AND
+            ("receiverId" = $1 OR "receiverId" ILIKE $2) AND
+            ("deletedByReceiver" IS NOT TRUE)
+          )
         )
         ${cursorFilter}
-        ORDER BY "createdAt" DESC
-        LIMIT $3
+        ORDER BY "createdAt" DESC, id DESC
+        LIMIT $5
       `;
 
       const { rows } = await pool.query(query, params);
+
+      // Fetch reactions for these messages
+      const msgIds = rows.map(r => r.id);
+      const reactionsByMsgId = {};
+      if (msgIds.length > 0) {
+        try {
+          const rxRows = await pool.query(
+            `SELECT r.id, r.emoji, r."userId", r."messageId", u.username
+             FROM "SocialReaction" r
+             LEFT JOIN "User" u ON u.id = r."userId"
+             WHERE r."messageId" = ANY($1::text[])`,
+            [msgIds]
+          );
+          for (const rx of rxRows.rows) {
+            if (!reactionsByMsgId[rx.messageId]) reactionsByMsgId[rx.messageId] = [];
+            reactionsByMsgId[rx.messageId].push({
+              id: rx.id,
+              emoji: rx.emoji,
+              userId: rx.userId,
+              user: { id: rx.userId, username: rx.username || 'User' }
+            });
+          }
+        } catch (rxErr) {
+          console.error('[Render API] fetch reactions error:', rxErr.message);
+        }
+      }
+
+      // rows is ordered DESC (newest first). Reverse so messages are returned in ascending chronological order (oldest to newest)
       const messages = rows.reverse().map(m => ({
         ...m,
         createdAt: m.createdAt ? new Date(m.createdAt).toISOString() : null,
         seenAt: m.seenAt ? new Date(m.seenAt).toISOString() : null,
+        reactions: reactionsByMsgId[m.id] || []
       }));
 
       return sendJson(res, 200, { messages });
@@ -424,12 +479,15 @@ const httpServer = createServer(async (req, res) => {
         senderUsername: senderInfo.username,
         senderEmail: senderInfo.email,
         senderImage: senderInfo.image,
-        senderBio: senderInfo.bio
+        senderBio: senderInfo.bio,
+        reactions: []
       };
 
+      // Register message ID in deduplication cache before emission so subsequent socket.emit('send_social_message') doesn't double-deliver
+      recordRecentlyEmitted(newId);
+
       // Broadcast to receiver only — sender already has message from REST response.
-      // Pass sender userId to exclude sender's own sockets from this broadcast,
-      // since the sender's socket.emit('send_social_message') will deliver to their other tabs.
+      // Pass sender userId to exclude sender's own sockets from this broadcast
       emitSocialMessageToTargets([
         { id: finalReceiverId, email: finalReceiverEmail, username: finalReceiverUsername },
         { id: receiverId, email: receiverEmail },
@@ -485,8 +543,16 @@ const httpServer = createServer(async (req, res) => {
         if (msg.senderId !== myId) return sendJson(res, 403, { error: 'You can only delete your own messages for everyone' });
         await pool.query(`UPDATE "SocialMessage" SET type = 'deleted', content = 'This message was deleted' WHERE id = $1`, [messageId]);
         
-        io.to(String(msg.receiverId)).emit('receive_social_delete', { messageId, deleteFor: 'everyone' });
-        io.to(String(msg.senderId)).emit('receive_social_delete', { messageId, deleteFor: 'everyone' });
+        const deletePayload = { messageId, deleteFor: 'everyone' };
+        const targetRooms = [
+          String(msg.receiverId),
+          `user:${String(msg.receiverId)}`,
+          String(msg.senderId),
+          `user:${String(msg.senderId)}`
+        ];
+        for (const r of targetRooms) {
+          io.to(r).emit('receive_social_delete', deletePayload);
+        }
       } else {
         if (msg.senderId === myId) {
           await pool.query(`UPDATE "SocialMessage" SET "deletedBySender" = true WHERE id = $1`, [messageId]);
@@ -500,6 +566,50 @@ const httpServer = createServer(async (req, res) => {
       console.error('[Render API] delete message error:', err);
       return sendJson(res, 500, { error: 'Failed to delete message' });
     }
+  }
+
+  // 4.5. Mark Messages As Seen (HTTP endpoint)
+  if (pathname === '/api/social/messages/seen' && req.method === 'POST') {
+    const user = await authenticateRequest(req);
+    if (!user) return sendJson(res, 401, { error: 'Unauthorized' });
+
+    const body = await parseJsonBody(req) || {};
+    const { senderId, senderEmail } = body;
+    const myId = user.id;
+    const myEmail = (user.email || '').toLowerCase().trim();
+
+    if (pool && (senderId || senderEmail)) {
+      try {
+        const cleanSenderId = senderId ? String(senderId).trim() : '';
+        const cleanSenderEmail = senderEmail ? String(senderEmail).toLowerCase().trim() : '';
+
+        await pool.query(`
+          UPDATE "SocialMessage"
+          SET "isSeen" = true, "seenAt" = NOW()
+          WHERE (
+            ("receiverId" = $1 OR "receiverId" ILIKE $2) AND
+            ("senderId" = $3 OR "senderId" ILIKE $4 OR ($3 = '' AND "senderId" ILIKE $4) OR ($4 = '' AND "senderId" = $3)) AND
+            "isSeen" = false
+          )
+        `, [myId, myEmail, cleanSenderId || cleanSenderEmail, cleanSenderEmail || cleanSenderId]);
+
+        const seenAt = new Date().toISOString();
+        const roomsToNotify = [
+          cleanSenderId,
+          cleanSenderId ? `user:${cleanSenderId}` : null,
+          cleanSenderEmail,
+          cleanSenderEmail ? `user:${cleanSenderEmail}` : null,
+        ].filter(Boolean);
+
+        for (const room of roomsToNotify) {
+          io.to(room).emit('messages_seen', { seenAt });
+        }
+      } catch (err) {
+        console.error('[Render API] mark seen error:', err);
+      }
+    }
+
+    return sendJson(res, 200, { success: true });
   }
 
   // 5. Global User Search (Indexed Trigram ILIKE search)
@@ -724,8 +834,17 @@ const httpServer = createServer(async (req, res) => {
       }
 
       const payload = { messageId, emoji, userId: myId };
-      if (receiverEmail) io.to(receiverEmail.toLowerCase().trim()).emit('receive_social_reaction', payload);
-      if (receiverId) io.to(String(receiverId).trim()).emit('receive_social_reaction', payload);
+      const reactionRooms = [
+        receiverEmail ? receiverEmail.toLowerCase().trim() : null,
+        receiverEmail ? `user:${receiverEmail.toLowerCase().trim()}` : null,
+        receiverId ? String(receiverId).trim() : null,
+        receiverId ? `user:${String(receiverId).trim()}` : null,
+        myId,
+        `user:${myId}`
+      ].filter(Boolean);
+      for (const room of reactionRooms) {
+        io.to(room).emit('receive_social_reaction', payload);
+      }
 
       return sendJson(res, 200, { success: true });
     } catch (err) {
@@ -930,6 +1049,30 @@ const io = new Server(httpServer, {
   }
 });
 
+// Server-side sliding window message deduplication cache
+const recentlyEmittedMessages = new Map(); // messageId -> timestamp
+const MESSAGE_DEDUP_TTL_MS = 15000;
+
+function recordRecentlyEmitted(msgId) {
+  if (!msgId) return;
+  recentlyEmittedMessages.set(String(msgId), Date.now());
+}
+
+function isRecentlyEmitted(msgId) {
+  if (!msgId) return false;
+  return recentlyEmittedMessages.has(String(msgId));
+}
+
+function pruneEmittedMessages() {
+  const now = Date.now();
+  for (const [id, time] of recentlyEmittedMessages.entries()) {
+    if (now - time > MESSAGE_DEDUP_TTL_MS) {
+      recentlyEmittedMessages.delete(id);
+    }
+  }
+}
+setInterval(pruneEmittedMessages, 30000);
+
 // A user can be in email, ID, and user:ID/username rooms. Emit strictly once per socket.
 // excludeSocketId: skip a specific socket (e.g. the sender's current tab)
 // excludeUserId: skip ALL sockets belonging to a user (e.g. sender from REST broadcast)
@@ -1124,7 +1267,7 @@ io.on('connection', (socket) => {
     if (!data) return;
     const senderEmailRoom = socket.userEmail ? socket.userEmail.toLowerCase().trim() : null;
 
-    let targetUsername = null;
+    let targetUsername = data.receiverUsername || null;
     let targetEmail = data.receiverEmail;
     let targetId = data.receiverId;
 
@@ -1143,44 +1286,168 @@ io.on('connection', (socket) => {
       } catch (e) {}
     }
 
+    let finalSenderId = socket.userId || data.senderId;
+    if (pool && (socket.userId || data.senderId || socket.userEmail || data.senderEmail)) {
+      try {
+        const sLookup = socket.userId || data.senderId || socket.userEmail || data.senderEmail;
+        const sRes = await pool.query(
+          `SELECT id, email, username FROM "User" WHERE id = $1 OR email ILIKE $2 OR username ILIKE $2 LIMIT 1`,
+          [sLookup, String(sLookup).trim().toLowerCase()]
+        );
+        if (sRes.rows.length > 0) {
+          finalSenderId = sRes.rows[0].id;
+        }
+      } catch (e) {}
+    }
+
+    const msgId = data.id || `msg_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    const alreadyEmitted = isRecentlyEmitted(msgId);
+    recordRecentlyEmitted(msgId);
+
+    // If message was not already persisted in DB (e.g. sent directly over socket or REST failed), persist it
+    if (pool && !alreadyEmitted && targetId && finalSenderId) {
+      try {
+        const existing = await pool.query(`SELECT id FROM "SocialMessage" WHERE id = $1 LIMIT 1`, [msgId]);
+        if (existing.rows.length === 0) {
+          const insertSql = `
+            INSERT INTO "SocialMessage" (
+              id, content, type, "senderId", "receiverId", "createdAt", "isSeen",
+              "deletedBySender", "deletedByReceiver",
+              "replyToId", "replyToContent", "replyToSenderName",
+              "mediaUrl", "thumbnailUrl", "mimeType", "fileSize", "width", "height", "duration", "storagePath"
+            ) VALUES (
+              $1, $2, $3, $4, $5, $6, false,
+              false, false,
+              $7, $8, $9,
+              $10, $11, $12, $13, $14, $15, $16, $17
+            ) ON CONFLICT (id) DO NOTHING
+          `;
+          await pool.query(insertSql, [
+            msgId,
+            data.content || '',
+            data.type || 'text',
+            finalSenderId,
+            targetId,
+            data.createdAt ? new Date(data.createdAt) : new Date(),
+            data.replyToId || null,
+            data.replyToContent || null,
+            data.replyToSenderName || null,
+            data.mediaUrl || null,
+            data.thumbnailUrl || null,
+            data.mimeType || null,
+            data.fileSize || null,
+            data.width || null,
+            data.height || null,
+            data.duration || null,
+            data.storagePath || null
+          ]);
+        }
+      } catch (dbErr) {
+        console.error('[Socket send_social_message DB persist error]', dbErr.message);
+      }
+    }
+
     // Enrich data with sender identity from socket.identify so receiver can build contact immediately
     const enriched = {
       ...data,
+      id: msgId,
       senderId: data.senderId || socket.userId,
       senderEmail: data.senderEmail || senderEmailRoom || '',
       senderUsername: data.senderUsername || socket.username || socket.camUsername || 'User',
       createdAt: data.createdAt || new Date().toISOString(),
+      reactions: data.reactions || []
     };
 
-    emitSocialMessageToTargets([
-      { id: targetId, email: targetEmail, username: targetUsername },
-      { id: data.receiverId, email: data.receiverEmail },
-      { id: socket.userId, email: socket.userEmail, username: socket.username },
-    ], enriched, socket.id);
+    if (alreadyEmitted) {
+      // Receiver was already delivered via REST POST response. Only sync to sender's other tabs.
+      emitSocialMessageToTargets([
+        { id: socket.userId, email: socket.userEmail, username: socket.username }
+      ], enriched, socket.id);
+    } else {
+      // First time emission: deliver to receiver targets and sender's other tabs
+      emitSocialMessageToTargets([
+        { id: targetId, email: targetEmail, username: targetUsername },
+        { id: data.receiverId, email: data.receiverEmail },
+        { id: socket.userId, email: socket.userEmail, username: socket.username },
+      ], enriched, socket.id);
+    }
   });
 
   socket.on('delete_social_message', (data) => {
     const { receiverEmail, receiverId, ...deleteData } = data;
-    if (receiverEmail) socket.to(receiverEmail.toLowerCase().trim()).emit('receive_social_delete', deleteData);
-    if (receiverId) socket.to(String(receiverId).trim()).emit('receive_social_delete', deleteData);
+    const targetRooms = [
+      receiverEmail ? receiverEmail.toLowerCase().trim() : null,
+      receiverEmail ? `user:${receiverEmail.toLowerCase().trim()}` : null,
+      receiverId ? String(receiverId).trim() : null,
+      receiverId ? `user:${String(receiverId).trim()}` : null,
+    ].filter(Boolean);
+    for (const r of targetRooms) {
+      socket.to(r).emit('receive_social_delete', deleteData);
+    }
   });
 
-  socket.on('react_social_message', (data) => {
+  socket.on('react_social_message', async (data) => {
     const { receiverEmail, receiverId, ...reactionData } = data;
-    const targetRoom = receiverEmail ? receiverEmail.toLowerCase().trim() : receiverId ? String(receiverId).trim() : null;
-    if (targetRoom) socket.to(targetRoom).emit('receive_social_reaction', reactionData);
+    const myId = socket.userId;
+    if (pool && myId && reactionData.messageId && reactionData.emoji) {
+      try {
+        const { messageId, emoji } = reactionData;
+        const existing = await pool.query(
+          `SELECT id, emoji FROM "SocialReaction" WHERE "userId" = $1 AND "messageId" = $2`,
+          [myId, messageId]
+        );
+        if (existing.rows.length > 0) {
+          if (existing.rows[0].emoji === emoji) {
+            await pool.query(`DELETE FROM "SocialReaction" WHERE id = $1`, [existing.rows[0].id]);
+          } else {
+            await pool.query(`UPDATE "SocialReaction" SET emoji = $1 WHERE id = $2`, [emoji, existing.rows[0].id]);
+          }
+        } else {
+          const reactionId = `react_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+          await pool.query(
+            `INSERT INTO "SocialReaction" (id, emoji, "userId", "messageId") VALUES ($1, $2, $3, $4)`,
+            [reactionId, emoji, myId, messageId]
+          );
+        }
+      } catch (rxErr) {
+        console.error('[Socket react error]', rxErr.message);
+      }
+    }
+    const targetRooms = [
+      receiverEmail ? receiverEmail.toLowerCase().trim() : null,
+      receiverEmail ? `user:${receiverEmail.toLowerCase().trim()}` : null,
+      receiverId ? String(receiverId).trim() : null,
+      receiverId ? `user:${String(receiverId).trim()}` : null,
+    ].filter(Boolean);
+    for (const r of targetRooms) {
+      socket.to(r).emit('receive_social_reaction', reactionData);
+    }
   });
 
   socket.on('change_chat_theme', (data) => {
     const { receiverEmail, receiverId, ...themeData } = data;
-    const targetRoom = receiverEmail ? receiverEmail.toLowerCase().trim() : receiverId ? String(receiverId).trim() : null;
-    if (targetRoom) socket.to(targetRoom).emit('receive_chat_theme', themeData);
+    const targetRooms = [
+      receiverEmail ? receiverEmail.toLowerCase().trim() : null,
+      receiverEmail ? `user:${receiverEmail.toLowerCase().trim()}` : null,
+      receiverId ? String(receiverId).trim() : null,
+      receiverId ? `user:${String(receiverId).trim()}` : null,
+    ].filter(Boolean);
+    for (const r of targetRooms) {
+      socket.to(r).emit('receive_chat_theme', themeData);
+    }
   });
 
   socket.on('change_nickname', (data) => {
     const { receiverEmail, receiverId, ...nicknameData } = data;
-    const targetRoom = receiverEmail ? receiverEmail.toLowerCase().trim() : receiverId ? String(receiverId).trim() : null;
-    if (targetRoom) socket.to(targetRoom).emit('receive_nickname', nicknameData);
+    const targetRooms = [
+      receiverEmail ? receiverEmail.toLowerCase().trim() : null,
+      receiverEmail ? `user:${receiverEmail.toLowerCase().trim()}` : null,
+      receiverId ? String(receiverId).trim() : null,
+      receiverId ? `user:${String(receiverId).trim()}` : null,
+    ].filter(Boolean);
+    for (const r of targetRooms) {
+      socket.to(r).emit('receive_nickname', nicknameData);
+    }
   });
 
   socket.on('user_profile_updated', (data) => {
@@ -1229,30 +1496,64 @@ io.on('connection', (socket) => {
 
   // TYPING
   socket.on('typing', ({ receiverEmail, receiverId }) => {
-    const payload = { email: socket.userEmail, userId: socket.userId };
-    if (receiverEmail) socket.to(receiverEmail.toLowerCase().trim()).emit('user_typing', payload);
-    if (receiverId) {
-      socket.to(String(receiverId).trim()).emit('user_typing', payload);
-      socket.to(`user:${String(receiverId).trim()}`).emit('user_typing', payload);
+    const payload = { email: socket.userEmail, userId: socket.userId, username: socket.username };
+    const targetRooms = [
+      receiverEmail ? receiverEmail.toLowerCase().trim() : null,
+      receiverEmail ? `user:${receiverEmail.toLowerCase().trim()}` : null,
+      receiverId ? String(receiverId).trim() : null,
+      receiverId ? `user:${String(receiverId).trim()}` : null,
+    ].filter(Boolean);
+    for (const r of targetRooms) {
+      socket.to(r).emit('user_typing', payload);
     }
   });
 
   socket.on('stop_typing', ({ receiverEmail, receiverId }) => {
-    const payload = { email: socket.userEmail, userId: socket.userId };
-    if (receiverEmail) socket.to(receiverEmail.toLowerCase().trim()).emit('user_stop_typing', payload);
-    if (receiverId) {
-      socket.to(String(receiverId).trim()).emit('user_stop_typing', payload);
-      socket.to(`user:${String(receiverId).trim()}`).emit('user_stop_typing', payload);
+    const payload = { email: socket.userEmail, userId: socket.userId, username: socket.username };
+    const targetRooms = [
+      receiverEmail ? receiverEmail.toLowerCase().trim() : null,
+      receiverEmail ? `user:${receiverEmail.toLowerCase().trim()}` : null,
+      receiverId ? String(receiverId).trim() : null,
+      receiverId ? `user:${String(receiverId).trim()}` : null,
+    ].filter(Boolean);
+    for (const r of targetRooms) {
+      socket.to(r).emit('user_stop_typing', payload);
     }
   });
 
   // SEEN
-  socket.on('mark_as_seen', ({ senderEmail, senderId }) => {
+  socket.on('mark_as_seen', async ({ senderEmail, senderId }) => {
     const seenAt = new Date().toISOString();
-    if (senderEmail) socket.to(senderEmail.toLowerCase().trim()).emit('messages_seen', { seenAt });
-    if (senderId) {
-      socket.to(String(senderId).trim()).emit('messages_seen', { seenAt });
-      socket.to(`user:${String(senderId).trim()}`).emit('messages_seen', { seenAt });
+    const myId = socket.userId;
+    const myEmail = socket.userEmail ? socket.userEmail.toLowerCase().trim() : null;
+
+    if (pool && (myId || myEmail) && (senderId || senderEmail)) {
+      try {
+        const cleanSenderId = senderId ? String(senderId).trim() : '';
+        const cleanSenderEmail = senderEmail ? String(senderEmail).toLowerCase().trim() : '';
+
+        await pool.query(`
+          UPDATE "SocialMessage"
+          SET "isSeen" = true, "seenAt" = NOW()
+          WHERE (
+            ("receiverId" = $1 OR "receiverId" ILIKE $2) AND
+            ("senderId" = $3 OR "senderId" ILIKE $4 OR ($3 = '' AND "senderId" ILIKE $4) OR ($4 = '' AND "senderId" = $3)) AND
+            "isSeen" = false
+          )
+        `, [myId || myEmail, myEmail || myId, cleanSenderId || cleanSenderEmail, cleanSenderEmail || cleanSenderId]);
+      } catch (e) {
+        console.error('[Socket mark_as_seen DB error]', e.message);
+      }
+    }
+
+    const targetRooms = [
+      senderEmail ? senderEmail.toLowerCase().trim() : null,
+      senderEmail ? `user:${senderEmail.toLowerCase().trim()}` : null,
+      senderId ? String(senderId).trim() : null,
+      senderId ? `user:${String(senderId).trim()}` : null,
+    ].filter(Boolean);
+    for (const r of targetRooms) {
+      socket.to(r).emit('messages_seen', { seenAt });
     }
   });
 

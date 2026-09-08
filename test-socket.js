@@ -129,6 +129,7 @@ async function runTests() {
   const socket2 = io(SOCKET_URL, {
     transports: ['websocket', 'polling'],
     reconnection: false,
+    forceNew: true,
     timeout: TIMEOUT_MS,
   });
 
@@ -178,6 +179,7 @@ async function runTests() {
   const socket3 = io(SOCKET_URL, {
     transports: ['websocket', 'polling'],
     reconnection: false,
+    forceNew: true,
     timeout: TIMEOUT_MS,
   });
 
@@ -207,6 +209,7 @@ async function runTests() {
   const socket4 = io(SOCKET_URL, {
     transports: ['websocket', 'polling'],
     reconnection: false,
+    forceNew: true,
     timeout: TIMEOUT_MS,
   });
 
