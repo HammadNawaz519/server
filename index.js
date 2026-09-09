@@ -452,6 +452,16 @@ const httpServer = createServer(async (req, res) => {
         mimeType, fileSize, width, height, duration, storagePath
       ]);
 
+      // Unhide chat for both users in HiddenSocialChat table if previously hidden
+      if (pool && myId && finalReceiverId) {
+        try {
+          await pool.query(
+            `DELETE FROM "HiddenSocialChat" WHERE ("userId" = $1 AND "hiddenUserId" = $2) OR ("userId" = $2 AND "hiddenUserId" = $1)`,
+            [myId, finalReceiverId]
+          );
+        } catch (e) {}
+      }
+
       // Fetch sender profile details to include in the realtime event so recipient immediately has profile info
       let senderInfo = {
         id: myId,
@@ -534,13 +544,15 @@ const httpServer = createServer(async (req, res) => {
 
     try {
       const myId = user.id;
+      const myEmail = (user.email || '').toLowerCase().trim();
       const msgRow = await pool.query(`SELECT * FROM "SocialMessage" WHERE id = $1 LIMIT 1`, [messageId]);
       if (msgRow.rows.length === 0) return sendJson(res, 404, { error: 'Message not found' });
 
       const msg = msgRow.rows[0];
 
       if (deleteFor === 'everyone') {
-        if (msg.senderId !== myId) return sendJson(res, 403, { error: 'You can only delete your own messages for everyone' });
+        const isOwner = msg.senderId === myId || (myEmail && msg.senderId.toLowerCase() === myEmail);
+        if (!isOwner) return sendJson(res, 403, { error: 'You can only delete your own messages for everyone' });
         await pool.query(`UPDATE "SocialMessage" SET type = 'deleted', content = 'This message was deleted' WHERE id = $1`, [messageId]);
         
         const deletePayload = { messageId, deleteFor: 'everyone' };
@@ -554,9 +566,11 @@ const httpServer = createServer(async (req, res) => {
           io.to(r).emit('receive_social_delete', deletePayload);
         }
       } else {
-        if (msg.senderId === myId) {
+        const isSender = msg.senderId === myId || (myEmail && msg.senderId.toLowerCase() === myEmail);
+        const isReceiver = msg.receiverId === myId || (myEmail && msg.receiverId.toLowerCase() === myEmail);
+        if (isSender) {
           await pool.query(`UPDATE "SocialMessage" SET "deletedBySender" = true WHERE id = $1`, [messageId]);
-        } else if (msg.receiverId === myId) {
+        } else if (isReceiver) {
           await pool.query(`UPDATE "SocialMessage" SET "deletedByReceiver" = true WHERE id = $1`, [messageId]);
         }
       }
@@ -610,6 +624,180 @@ const httpServer = createServer(async (req, res) => {
     }
 
     return sendJson(res, 200, { success: true });
+  }
+
+  // 4.6. Hide or Clear Chat
+  if ((pathname === '/api/social/chats/hide' || pathname === '/api/social/messages/clear') && req.method === 'POST') {
+    const user = await authenticateRequest(req);
+    if (!user) return sendJson(res, 401, { error: 'Unauthorized' });
+
+    const body = await parseJsonBody(req) || {};
+    const targetId = body.targetId || body.hiddenUserId;
+    if (!targetId) return sendJson(res, 400, { error: 'targetId is required' });
+
+    const myId = user.id;
+    const myEmail = (user.email || '').toLowerCase().trim();
+
+    try {
+      // Resolve target user UUID and email
+      const targetRes = await pool.query(
+        `SELECT id, email FROM "User" WHERE id = $1 OR email ILIKE $2 LIMIT 1`,
+        [targetId, String(targetId).toLowerCase().trim()]
+      );
+      const cleanTargetId = targetRes.rows.length > 0 ? targetRes.rows[0].id : targetId;
+      const cleanTargetEmail = targetRes.rows.length > 0 ? (targetRes.rows[0].email || '').toLowerCase().trim() : '';
+
+      // Mark sent messages as deletedBySender
+      await pool.query(`
+        UPDATE "SocialMessage" SET "deletedBySender" = true
+        WHERE ("senderId" = $1 OR "senderId" ILIKE $2)
+          AND ("receiverId" = $3 OR "receiverId" ILIKE $4 OR ($4 = '' AND "receiverId" = $3))
+      `, [myId, myEmail, cleanTargetId, cleanTargetEmail]);
+
+      // Mark received messages as deletedByReceiver
+      await pool.query(`
+        UPDATE "SocialMessage" SET "deletedByReceiver" = true
+        WHERE ("senderId" = $3 OR "senderId" ILIKE $4 OR ($4 = '' AND "senderId" = $3))
+          AND ("receiverId" = $1 OR "receiverId" ILIKE $2)
+      `, [myId, myEmail, cleanTargetId, cleanTargetEmail]);
+
+      // Clean up messages where both users deleted (except calls)
+      await pool.query(`
+        DELETE FROM "SocialMessage"
+        WHERE "deletedBySender" = true
+          AND "deletedByReceiver" = true
+          AND type != 'call'
+          AND (
+            (("senderId" = $1 OR "senderId" ILIKE $2) AND ("receiverId" = $3 OR "receiverId" ILIKE $4)) OR
+            (("senderId" = $3 OR "senderId" ILIKE $4) AND ("receiverId" = $1 OR "receiverId" ILIKE $2))
+          )
+      `, [myId, myEmail, cleanTargetId, cleanTargetEmail]).catch(() => {});
+
+      // Track in HiddenSocialChat table
+      const hideId = `hide_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      await pool.query(`
+        INSERT INTO "HiddenSocialChat" (id, "userId", "hiddenUserId", "createdAt")
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT ("userId", "hiddenUserId") DO NOTHING
+      `, [hideId, myId, cleanTargetId]);
+
+      return sendJson(res, 200, { success: true });
+    } catch (err) {
+      console.error('[Render API] hide chat error:', err);
+      return sendJson(res, 500, { error: 'Failed to hide chat' });
+    }
+  }
+
+  // 4.7. Call History
+  if (pathname === '/api/social/calls' && req.method === 'GET') {
+    const user = await authenticateRequest(req);
+    if (!user) return sendJson(res, 401, { error: 'Unauthorized' });
+
+    try {
+      const myId = user.id;
+      const { rows } = await pool.query(`
+        SELECT sc.id, sc."callerId", sc."receiverId", sc.type, sc.status, sc.duration, sc."createdAt",
+               u1.username as caller_username, u1.image as caller_image,
+               u2.username as receiver_username, u2.image as receiver_image
+        FROM "SocialCall" sc
+        LEFT JOIN "User" u1 ON u1.id = sc."callerId"
+        LEFT JOIN "User" u2 ON u2.id = sc."receiverId"
+        WHERE sc."callerId" = $1 OR sc."receiverId" = $1
+        ORDER BY sc."createdAt" DESC
+        LIMIT 50
+      `, [myId]);
+
+      const calls = rows.map(r => ({
+        id: r.id,
+        callerId: r.callerId,
+        receiverId: r.receiverId,
+        type: r.type,
+        status: r.status,
+        duration: r.duration,
+        createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : new Date().toISOString(),
+        caller: {
+          id: r.callerId,
+          username: r.caller_username || 'User',
+          image: r.caller_image || null
+        },
+        receiver: {
+          id: r.receiverId,
+          username: r.receiver_username || 'User',
+          image: r.receiver_image || null
+        }
+      }));
+
+      return sendJson(res, 200, { calls });
+    } catch (err) {
+      console.error('[Render API] calls error:', err);
+      return sendJson(res, 200, { calls: [] });
+    }
+  }
+
+  // 4.8. Save Call (Logs call in SocialCall and creates chat history message)
+  if (pathname === '/api/social/calls' && req.method === 'POST') {
+    const user = await authenticateRequest(req);
+    if (!user) return sendJson(res, 401, { error: 'Unauthorized' });
+
+    const body = await parseJsonBody(req) || {};
+    const { receiverId, type = 'audio', status = 'completed', duration = 0 } = body;
+    if (!receiverId) return sendJson(res, 400, { error: 'receiverId is required' });
+
+    try {
+      const callId = `call_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      await pool.query(`
+        INSERT INTO "SocialCall" (id, "callerId", "receiverId", type, status, duration, "createdAt")
+        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+      `, [callId, user.id, receiverId, type, status, duration || 0]);
+
+      let callContent = "";
+      if (status === 'missed') callContent = `Missed ${type} call`;
+      else if (status === 'rejected') callContent = `${type.charAt(0).toUpperCase() + type.slice(1)} call rejected`;
+      else {
+        const mins = Math.floor((duration || 0) / 60);
+        const secs = (duration || 0) % 60;
+        const durStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+        callContent = `${type.charAt(0).toUpperCase() + type.slice(1)} call ended • ${durStr}`;
+      }
+
+      const msgId = `msg_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const msgRes = await pool.query(`
+        INSERT INTO "SocialMessage" (
+          id, content, type, "senderId", "receiverId", "createdAt", "isSeen",
+          "deletedBySender", "deletedByReceiver"
+        ) VALUES (
+          $1, $2, 'call', $3, $4, NOW(), false,
+          false, false
+        ) RETURNING *
+      `, [msgId, callContent, user.id, receiverId]);
+
+      const message = {
+        ...msgRes.rows[0],
+        createdAt: new Date(msgRes.rows[0].createdAt).toISOString(),
+        reactions: []
+      };
+
+      return sendJson(res, 200, { success: true, callId, message });
+    } catch (err) {
+      console.error('[Render API] save call error:', err);
+      return sendJson(res, 500, { error: 'Failed to save call' });
+    }
+  }
+
+  // 4.9. Clear Call History
+  if (pathname === '/api/social/calls' && req.method === 'DELETE') {
+    const user = await authenticateRequest(req);
+    if (!user) return sendJson(res, 401, { error: 'Unauthorized' });
+
+    try {
+      const myId = user.id;
+      await pool.query(`DELETE FROM "SocialCall" WHERE "callerId" = $1 OR "receiverId" = $1`, [myId]);
+      await pool.query(`DELETE FROM "SocialMessage" WHERE ("senderId" = $1 OR "receiverId" = $1) AND type = 'call'`, [myId]);
+      return sendJson(res, 200, { success: true });
+    } catch (err) {
+      console.error('[Render API] clear calls error:', err);
+      return sendJson(res, 500, { error: 'Failed to clear calls' });
+    }
   }
 
   // 5. Global User Search (Indexed Trigram ILIKE search)
@@ -981,58 +1169,6 @@ const httpServer = createServer(async (req, res) => {
     }
   }
 
-  // 13. Call History
-  if (pathname === '/api/social/calls' && req.method === 'GET') {
-    const user = await authenticateRequest(req);
-    if (!user) return sendJson(res, 401, { error: 'Unauthorized' });
-
-    try {
-      const myId = user.id;
-      const { rows } = await pool.query(`
-        SELECT c.id, c.type, c.status, c.duration, c."createdAt",
-               c."callerId", c."receiverId",
-               u1.username as caller_username, u1.image as caller_image,
-               u2.username as receiver_username, u2.image as receiver_image
-        FROM "SocialCall" c
-        JOIN "User" u1 ON u1.id = c."callerId"
-        JOIN "User" u2 ON u2.id = c."receiverId"
-        WHERE c."callerId" = $1 OR c."receiverId" = $1
-        ORDER BY c."createdAt" DESC
-        LIMIT 50
-      `, [myId]);
-
-      return sendJson(res, 200, { calls: rows });
-    } catch (err) {
-      console.error('[Render API] get calls error:', err);
-      return sendJson(res, 500, { error: 'Failed to get calls' });
-    }
-  }
-
-  if (pathname === '/api/social/calls' && req.method === 'POST') {
-    const user = await authenticateRequest(req);
-    if (!user) return sendJson(res, 401, { error: 'Unauthorized' });
-
-    const body = await parseJsonBody(req);
-    if (!body || !body.receiverId) return sendJson(res, 400, { error: 'receiverId required' });
-
-    try {
-      const myId = user.id;
-      const { receiverId, type = 'audio', status = 'completed', duration = 0 } = body;
-      const callId = `call_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-
-      const { rows } = await pool.query(`
-        INSERT INTO "SocialCall" (id, "callerId", "receiverId", type, status, duration, "createdAt")
-        VALUES ($1, $2, $3, $4, $5, $6, NOW())
-        RETURNING *
-      `, [callId, myId, receiverId, type, status, duration]);
-
-      return sendJson(res, 200, { success: true, call: rows[0] });
-    } catch (err) {
-      console.error('[Render API] save call error:', err);
-      return sendJson(res, 500, { error: 'Failed to save call' });
-    }
-  }
-
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Connect Node.js API & Socket Server is running');
 });
@@ -1166,13 +1302,32 @@ function broadcastOnlineUsers() {
   io.emit('online_users', onlineList);
 }
 
+async function persistUserPresence(userId, email, isOnline, lastSeen) {
+  if (!pool || (!userId && !email)) return;
+  try {
+    const ts = lastSeen ? new Date(lastSeen) : new Date();
+    const idVal = userId ? String(userId).trim() : '';
+    const emailVal = email ? String(email).trim().toLowerCase() : '';
+    await pool.query(
+      `UPDATE "User" 
+       SET "isOnline" = $1, "lastSeen" = $2, "lastHeartbeat" = NOW() 
+       WHERE (id = $3 AND $3 <> '') OR (email ILIKE $4 AND $4 <> '')`,
+      [Boolean(isOnline), ts, idVal, emailVal]
+    );
+  } catch (err) {
+    console.error('[DB persistUserPresence error]', err.message);
+  }
+}
+
 function broadcastActivityUpdate(userId, email, isOnline, lastSeen) {
+  const lastSeenStr = lastSeen || new Date().toISOString();
   io.emit('activity_update', {
     userId,
     email: email ? email.toLowerCase().trim() : undefined,
     isOnline,
-    lastSeen: lastSeen || new Date().toISOString()
+    lastSeen: lastSeenStr
   });
+  persistUserPresence(userId, email, isOnline, lastSeenStr);
 }
 
 // 30-Second Sweep for Stale Heartbeats
@@ -1255,11 +1410,21 @@ io.on('connection', (socket) => {
 
   // HEARTBEAT
   socket.on('heartbeat', ({ userId, email }) => {
+    const uid = socket.userId || userId;
+    const eml = socket.userEmail || (email ? email.toLowerCase().trim() : undefined);
     heartbeatMap.set(socket.id, {
-      userId: socket.userId || userId,
-      email: socket.userEmail || (email ? email.toLowerCase().trim() : undefined),
+      userId: uid,
+      email: eml,
       timestamp: Date.now()
     });
+    if (pool && (uid || eml)) {
+      const idVal = uid ? String(uid).trim() : '';
+      const emailVal = eml ? String(eml).trim().toLowerCase() : '';
+      pool.query(
+        `UPDATE "User" SET "lastHeartbeat" = NOW(), "isOnline" = true WHERE (id = $1 AND $1 <> '') OR (email ILIKE $2 AND $2 <> '')`,
+        [idVal, emailVal]
+      ).catch(() => {});
+    }
   });
 
   // MESSAGING
@@ -1341,6 +1506,14 @@ io.on('connection', (socket) => {
             data.duration || null,
             data.storagePath || null
           ]);
+
+          // Automatically unhide chat for both users if previously hidden
+          await pool.query(
+            `DELETE FROM "HiddenSocialChat" 
+             WHERE ("userId" = $1 AND "hiddenUserId" = $2) 
+                OR ("userId" = $2 AND "hiddenUserId" = $1)`,
+            [finalSenderId, targetId]
+          );
         }
       } catch (dbErr) {
         console.error('[Socket send_social_message DB persist error]', dbErr.message);
@@ -1351,9 +1524,10 @@ io.on('connection', (socket) => {
     const enriched = {
       ...data,
       id: msgId,
-      senderId: data.senderId || socket.userId,
+      senderId: finalSenderId || data.senderId || socket.userId,
       senderEmail: data.senderEmail || senderEmailRoom || '',
       senderUsername: data.senderUsername || socket.username || socket.camUsername || 'User',
+      receiverId: targetId || data.receiverId,
       createdAt: data.createdAt || new Date().toISOString(),
       reactions: data.reactions || []
     };
@@ -1373,8 +1547,21 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('delete_social_message', (data) => {
-    const { receiverEmail, receiverId, ...deleteData } = data;
+  socket.on('delete_social_message', async (data) => {
+    if (!data) return;
+    const { receiverEmail, receiverId, messageId, deleteFor, ...deleteData } = data;
+
+    if (pool && messageId && deleteFor === 'everyone') {
+      try {
+        await pool.query(
+          `UPDATE "SocialMessage" SET type = 'deleted', content = 'This message was deleted' WHERE id = $1`,
+          [messageId]
+        );
+      } catch (e) {
+        console.error('[Socket delete_social_message DB error]', e.message);
+      }
+    }
+
     const targetRooms = [
       receiverEmail ? receiverEmail.toLowerCase().trim() : null,
       receiverEmail ? `user:${receiverEmail.toLowerCase().trim()}` : null,
@@ -1382,7 +1569,7 @@ io.on('connection', (socket) => {
       receiverId ? `user:${String(receiverId).trim()}` : null,
     ].filter(Boolean);
     for (const r of targetRooms) {
-      socket.to(r).emit('receive_social_delete', deleteData);
+      socket.to(r).emit('receive_social_delete', { messageId, deleteFor, ...deleteData });
     }
   });
 
