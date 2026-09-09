@@ -16,15 +16,74 @@ if (rawDbUrl) {
   }
   pool = new Pool({
     connectionString: dbUrl,
-    max: 10,
-    idleTimeoutMillis: 300000,
-    connectionTimeoutMillis: 8000,
+    max: 12,
+    idleTimeoutMillis: 60000,
+    connectionTimeoutMillis: 6000,
+    statement_timeout: 8000, // 8s query limit prevents hung connections from locking pool
+    query_timeout: 9000,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10000,
     ssl: { rejectUnauthorized: false }
   });
   pool.on('error', (err) => {
     console.error('[Database Pool Error]', err.message);
   });
+  // Warm up connection pool immediately on boot for instant first request
+  pool.query('SELECT 1').then(async () => {
+    console.log('>>> [Database Pool] Primed and warm');
+    try {
+      await pool.query('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS name TEXT;');
+    } catch (e) {}
+  }).catch((err) => {
+    console.warn('>>> [Database Pool] Initial probe warning:', err.message);
+  });
 }
+
+// ── In-Memory Token Bucket Rate Limiter ──────────────────────────────────────
+const rateLimitMap = new Map(); // key -> { tokens, lastRefill }
+function checkRateLimit(key, maxTokens = 30, refillRatePerSec = 5) {
+  if (!key) return true;
+  const now = Date.now();
+  let bucket = rateLimitMap.get(key);
+  if (!bucket) {
+    bucket = { tokens: maxTokens - 1, lastRefill: now };
+    rateLimitMap.set(key, bucket);
+    return true;
+  }
+  const elapsedSec = (now - bucket.lastRefill) / 1000;
+  bucket.tokens = Math.min(maxTokens, bucket.tokens + elapsedSec * refillRatePerSec);
+  bucket.lastRefill = now;
+  if (bucket.tokens >= 1) {
+    bucket.tokens -= 1;
+    return true;
+  }
+  return false;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateLimitMap.entries()) {
+    if (now - bucket.lastRefill > 60000) {
+      rateLimitMap.delete(key);
+    }
+  }
+}, 300000);
+
+// ── Render Free-Tier Dyno Keep-Alive ─────────────────────────────────────────
+// Free services on Render spin down after 15 mins of inactivity.
+// Pinging self every 13 minutes eliminates cold-start delay for users.
+const RENDER_SERVICE_URL = process.env.RENDER_EXTERNAL_URL || 'https://server-6gmj.onrender.com';
+function startSelfKeepAlive() {
+  if (process.env.NODE_ENV === 'test') return;
+  const PING_INTERVAL_MS = 13 * 60 * 1000;
+  setInterval(async () => {
+    try {
+      if (typeof fetch !== 'undefined') {
+        await fetch(`${RENDER_SERVICE_URL}/health`).catch(() => {});
+      }
+    } catch (e) {}
+  }, PING_INTERVAL_MS);
+}
+startSelfKeepAlive();
 
 // ── Helper: Parse JSON Body ─────────────────────────────────────────────────
 function parseJsonBody(req) {
@@ -133,7 +192,25 @@ const httpServer = createServer(async (req, res) => {
 
   // ── Health & Keep-alive ───────────────────────────────────────────────────
   if (pathname === '/health' || pathname === '/ping') {
-    return sendJson(res, 200, { status: 'ok', timestamp: new Date().toISOString() });
+    let dbStatus = 'disconnected';
+    if (pool) {
+      try {
+        const start = Date.now();
+        await pool.query('SELECT 1');
+        dbStatus = `healthy (${Date.now() - start}ms)`;
+      } catch (e) {
+        dbStatus = `error: ${e.message}`;
+      }
+    }
+    return sendJson(res, 200, {
+      status: 'ok',
+      uptime: Math.round(process.uptime()),
+      db: dbStatus,
+      onlineUsers: typeof onlineUsers !== 'undefined' ? onlineUsers.size : 0,
+      activeSockets: typeof io !== 'undefined' ? io.sockets?.sockets?.size || 0 : 0,
+      memoryMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+      timestamp: new Date().toISOString()
+    });
   }
 
   // ── TURN Credentials ──────────────────────────────────────────────────────
@@ -226,7 +303,8 @@ const httpServer = createServer(async (req, res) => {
           COALESCE(uc.unseen_count, 0) as unseen_count
         FROM MatchedUsers mu
         LEFT JOIN UnseenCounts uc ON uc.sender_user_id = mu.matched_user_id
-        WHERE mu.rn = 1
+        LEFT JOIN "HiddenSocialChat" hc ON (hc."userId" = $1 AND (hc."hiddenUserId" = mu.matched_user_id OR (hc."hiddenUserId" ILIKE mu.user_email AND mu.user_email <> '')))
+        WHERE mu.rn = 1 AND hc.id IS NULL
         ORDER BY mu."createdAt" DESC
       `, [myId, myEmail]);
 
@@ -394,6 +472,10 @@ const httpServer = createServer(async (req, res) => {
   if (pathname === '/api/social/messages' && req.method === 'POST') {
     const user = await authenticateRequest(req);
     if (!user) return sendJson(res, 401, { error: 'Unauthorized' });
+
+    if (!checkRateLimit(`msg_rest_${user.id}`, 30, 6)) {
+      return sendJson(res, 429, { error: 'Sending messages too quickly. Please slow down.' });
+    }
 
     const body = await parseJsonBody(req);
     if (!body || !body.receiverId || (!body.content && !body.mediaUrl)) {
@@ -771,6 +853,16 @@ const httpServer = createServer(async (req, res) => {
         ) RETURNING *
       `, [msgId, callContent, user.id, receiverId]);
 
+      // Unhide chat for both users in HiddenSocialChat table so call history is immediately visible
+      if (pool && user.id && receiverId) {
+        try {
+          await pool.query(
+            `DELETE FROM "HiddenSocialChat" WHERE ("userId" = $1 AND "hiddenUserId" = $2) OR ("userId" = $2 AND "hiddenUserId" = $1)`,
+            [user.id, receiverId]
+          );
+        } catch (e) {}
+      }
+
       const message = {
         ...msgRes.rows[0],
         createdAt: new Date(msgRes.rows[0].createdAt).toISOString(),
@@ -800,37 +892,54 @@ const httpServer = createServer(async (req, res) => {
     }
   }
 
-  // 5. Global User Search (Indexed Trigram ILIKE search)
+  // 5. Global User Search (Optimized Multi-Field ILIKE search with exact, prefix & substring priority)
   if (pathname === '/api/social/search' && req.method === 'GET') {
     const user = await authenticateRequest(req);
     const myId = user ? user.id : '';
+
+    if (user && !checkRateLimit(`search_${user.id}`, 25, 5)) {
+      return sendJson(res, 429, { error: 'Please slow down search queries' });
+    }
 
     const queryStr = (parsedUrl.searchParams.get('q') || '').trim();
     if (!queryStr) return sendJson(res, 200, { users: [] });
 
     try {
       const rawQ = queryStr.replace(/^@+/, '').trim();
-      const startsPattern = `${rawQ}%`;
+      const exactPattern = rawQ;
+      const prefixPattern = `${rawQ}%`;
+      const substringPattern = `%${rawQ}%`;
 
       const { rows } = await pool.query(`
-        SELECT id, username, email, image, bio, "lastSeen"
+        SELECT id, username, email, name, image, bio, "lastSeen", "isOnline"
         FROM "User"
-        WHERE ($1 = '' OR id != $1) AND (username ILIKE $2)
+        WHERE ($1 = '' OR id != $1)
+          AND (
+            username ILIKE $2 OR
+            email ILIKE $2 OR
+            name ILIKE $2
+          )
         ORDER BY
           CASE
             WHEN username ILIKE $3 THEN 1
-            ELSE 2
+            WHEN email ILIKE $3 THEN 2
+            WHEN username ILIKE $4 THEN 3
+            WHEN name ILIKE $4 THEN 4
+            ELSE 5
           END,
+          "isOnline" DESC,
           username ASC
         LIMIT 40
-      `, [myId, startsPattern, rawQ]);
+      `, [myId, substringPattern, exactPattern, prefixPattern]);
 
       const users = rows.map(u => ({
         id: u.id,
         username: u.username,
+        name: u.name || u.username,
         email: u.email,
         image: u.image || '',
         bio: u.bio,
+        isOnline: Boolean(u.isOnline),
         lastSeen: u.lastSeen ? new Date(u.lastSeen).toISOString() : null
       }));
 
@@ -1181,8 +1290,13 @@ const allowedOrigins = process.env.CLIENT_URL
 const io = new Server(httpServer, {
   cors: {
     origin: allowedOrigins,
-    methods: ['GET', 'POST', 'PUT', 'DELETE']
-  }
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    credentials: true
+  },
+  pingTimeout: 20000,
+  pingInterval: 10000,
+  maxHttpBufferSize: 1e7, // 10MB limit for rich media
+  transports: ['websocket', 'polling']
 });
 
 // Server-side sliding window message deduplication cache
@@ -1266,10 +1380,34 @@ function emitSocialMessageToTargets(targets, message, excludeSocketId = null, ex
     }
   }
 
+  let deliveredCount = 0;
   // Emit strictly once per unique socket to completely eliminate duplicate notifications
   for (const socketId of socketIds) {
     if (!excludedSocketIds.has(socketId)) {
-      io.sockets.sockets.get(socketId)?.emit('receive_social_message', message);
+      const s = io.sockets.sockets.get(socketId);
+      if (s && s.connected) {
+        s.emit('receive_social_message', message);
+        deliveredCount++;
+      }
+    }
+  }
+
+  // If delivered to at least one active recipient socket, notify sender with delivery receipt
+  if (deliveredCount > 0 && (message.senderId || message.senderEmail)) {
+    const senderRooms = [
+      message.senderId ? String(message.senderId).trim() : null,
+      message.senderId ? `user:${String(message.senderId).trim()}` : null,
+      message.senderEmail ? String(message.senderEmail).toLowerCase().trim() : null,
+      message.senderEmail ? `user:${String(message.senderEmail).toLowerCase().trim()}` : null
+    ].filter(Boolean);
+
+    const deliveryPayload = {
+      messageId: message.id,
+      receiverId: message.receiverId,
+      deliveredAt: new Date().toISOString()
+    };
+    for (const r of senderRooms) {
+      io.to(r).emit('message_delivered', deliveryPayload);
     }
   }
 }
@@ -1361,6 +1499,7 @@ setInterval(() => {
 }, 30 * 1000);
 
 io.on('connection', (socket) => {
+  socket.activeTypingRooms = new Set();
   socket.emit('online_users', Array.from(onlineUsers.keys()));
 
   // IDENTIFY
@@ -1430,6 +1569,14 @@ io.on('connection', (socket) => {
   // MESSAGING
   socket.on('send_social_message', async (data) => {
     if (!data) return;
+
+    // Rate limiter: max 30 msgs per 5s per socket / user
+    const rateLimitKey = `sock_msg_${socket.userId || socket.userEmail || socket.id}`;
+    if (!checkRateLimit(rateLimitKey, 30, 6)) {
+      socket.emit('error_notification', { message: 'Sending messages too quickly. Please slow down.' });
+      return;
+    }
+
     const senderEmailRoom = socket.userEmail ? socket.userEmail.toLowerCase().trim() : null;
 
     let targetUsername = data.receiverUsername || null;
@@ -1691,6 +1838,7 @@ io.on('connection', (socket) => {
       receiverId ? `user:${String(receiverId).trim()}` : null,
     ].filter(Boolean);
     for (const r of targetRooms) {
+      if (socket.activeTypingRooms) socket.activeTypingRooms.add(r);
       socket.to(r).emit('user_typing', payload);
     }
   });
@@ -1704,6 +1852,7 @@ io.on('connection', (socket) => {
       receiverId ? `user:${String(receiverId).trim()}` : null,
     ].filter(Boolean);
     for (const r of targetRooms) {
+      if (socket.activeTypingRooms) socket.activeTypingRooms.delete(r);
       socket.to(r).emit('user_stop_typing', payload);
     }
   });
@@ -2105,6 +2254,15 @@ io.on('connection', (socket) => {
     activeCalls.delete(socket.id);
     callRateLimitMap.delete(socket.id);
     heartbeatMap.delete(socket.id);
+
+    // Clean up any remaining typing indicators for this socket
+    if (socket.activeTypingRooms && socket.activeTypingRooms.size > 0) {
+      const payload = { email: socket.userEmail, userId: socket.userId, username: socket.username };
+      for (const r of socket.activeTypingRooms) {
+        socket.to(r).emit('user_stop_typing', payload);
+      }
+      socket.activeTypingRooms.clear();
+    }
 
     if (socket.camRegistered || socket.userEmail) {
       ADMIN_EMAILS.forEach(adminEmail => {
